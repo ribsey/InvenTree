@@ -18,7 +18,7 @@ import {
   DescriptionColumn
 } from '../../components/tables/ColumnRenderers';
 import { InvenTreeTable } from '../../components/tables/InvenTreeTable';
-import { stockLocationFields } from '../../forms/StockForms';
+import { useStockLocationFields } from '../../forms/StockForms';
 import { InvenTreeIcon } from '../../functions/icons';
 import {
   useBulkEditApiFormModal,
@@ -50,6 +50,11 @@ export function StockLocationTable({ parentId }: Readonly<{ parentId?: any }>) {
         name: 'external',
         label: t`External`,
         description: t`Show external locations`
+      },
+      {
+        name: 'exclude_from_stock',
+        label: t`Exclude from Stock`,
+        description: t`Show locations excluded from stock calculations`
       },
       {
         name: 'has_location_type',
@@ -97,6 +102,10 @@ export function StockLocationTable({ parentId }: Readonly<{ parentId?: any }>) {
         accessor: 'external',
         defaultVisible: false
       }),
+      BooleanColumn({
+        accessor: 'exclude_from_stock',
+        defaultVisible: false
+      }),
       {
         accessor: 'location_type',
         sortable: false,
@@ -109,7 +118,7 @@ export function StockLocationTable({ parentId }: Readonly<{ parentId?: any }>) {
   const newLocation = useCreateApiFormModal({
     url: ApiEndpoints.stock_location_list,
     title: t`Add Stock Location`,
-    fields: stockLocationFields(),
+    fields: useStockLocationFields(),
     focus: 'name',
     initialData: {
       parent: parentId
@@ -126,7 +135,7 @@ export function StockLocationTable({ parentId }: Readonly<{ parentId?: any }>) {
     url: ApiEndpoints.stock_location_list,
     pk: selectedLocation,
     title: t`Edit Stock Location`,
-    fields: stockLocationFields(),
+    fields: useStockLocationFields(),
     onFormSuccess: (record: any) => table.updateRecord(record)
   });
 

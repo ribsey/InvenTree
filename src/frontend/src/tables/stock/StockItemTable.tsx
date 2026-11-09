@@ -320,6 +320,11 @@ function stockItemTableFilters({
       label: t`External Location`,
       description: t`Show items in an external location`
     },
+    {
+      name: 'exclude_from_stock',
+      label: t`Exclude from Stock`,
+      description: t`Show items in a location excluded from stock calculations`
+    },
     TagsFilter({ modelType: ModelType.stockitem })
   ];
 }
@@ -412,6 +417,7 @@ export function StockItemTable({
   const newStockItemFields = useStockFields({
     create: true,
     partId: params.part,
+    locationId: params.location,
     supplierPartId: params.supplier_part,
     pricing: params.pricing,
     modalId: 'add-stock-item'
@@ -423,8 +429,7 @@ export function StockItemTable({
     modalId: 'add-stock-item',
     fields: newStockItemFields,
     initialData: {
-      part: params.part,
-      location: params.location
+      part: params.part
     },
     follow: params.openNewStockItem ?? true,
     table: table,

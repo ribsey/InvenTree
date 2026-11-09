@@ -25,9 +25,17 @@ from corsheaders.defaults import default_headers as default_cors_headers
 
 import InvenTree.backup
 from InvenTree.cache import get_cache_config, is_global_cache_enabled
-from InvenTree.config import get_boolean_setting, get_oidc_private_key, get_setting
+from InvenTree.config import (
+    ensure_middleware,
+    ensure_removed,
+    get_boolean_setting,
+    get_oidc_private_key,
+    get_setting,
+)
 from InvenTree.ready import isInMainThread, isRunningBackup
 from InvenTree.sentry import default_sentry_dsn, init_sentry
+from InvenTree.tracing import ensure_otel_middleware
+from InvenTree.validators import invalid_site_url_hint
 from InvenTree.version import checkMinPythonVersion, inventreeCommitHash
 from users.oauth2_scopes import oauth2_scopes
 
@@ -101,7 +109,29 @@ JSON_LOG = get_boolean_setting('INVENTREE_JSON_LOG', 'json_log', False)
 WRITE_LOG = get_boolean_setting('INVENTREE_WRITE_LOG', 'write_log', False)
 CONSOLE_LOG = get_boolean_setting('INVENTREE_CONSOLE_LOG', 'console_log', True)
 
-logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s %(message)s')
+# Ensure all log records have the same shape
+LOG_FOREIGN_PRE_CHAIN = [
+    structlog.processors.TimeStamper(fmt='iso'),
+    structlog.stdlib.add_logger_name,
+    structlog.stdlib.add_log_level,
+]
+LOG_JSON_PROCESSORS = [
+    structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+    structlog.processors.format_exc_info,
+    structlog.processors.JSONRenderer(),
+]
+
+if JSON_LOG:
+    # startup logging
+    _early_log_handler = logging.StreamHandler()
+    _early_log_handler.setFormatter(
+        structlog.stdlib.ProcessorFormatter(
+            processors=LOG_JSON_PROCESSORS, foreign_pre_chain=LOG_FOREIGN_PRE_CHAIN
+        )
+    )
+    logging.basicConfig(level=LOG_LEVEL, handlers=[_early_log_handler])
+else:
+    logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s %(levelname)s %(message)s')
 
 if LOG_LEVEL not in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL']:
     LOG_LEVEL = 'WARNING'  # pragma: no cover
@@ -117,27 +147,34 @@ LOGGING = {
     'formatters': {
         'json_formatter': {
             '()': structlog.stdlib.ProcessorFormatter,
-            'processor': structlog.processors.JSONRenderer(),
+            'processors': LOG_JSON_PROCESSORS,
+            'foreign_pre_chain': LOG_FOREIGN_PRE_CHAIN,
         },
         'plain_console': {
             '()': structlog.stdlib.ProcessorFormatter,
             'processor': structlog.dev.ConsoleRenderer(),
+            'foreign_pre_chain': LOG_FOREIGN_PRE_CHAIN,
         },
         'key_value': {
             '()': structlog.stdlib.ProcessorFormatter,
             'processor': structlog.processors.KeyValueRenderer(
                 key_order=['timestamp', 'level', 'event', 'logger']
             ),
+            'foreign_pre_chain': LOG_FOREIGN_PRE_CHAIN,
         },
     },
     'handlers': {
-        'console': {'class': 'logging.StreamHandler', 'formatter': 'plain_console'}
+        'console': {
+            'class': 'logging.StreamHandler',
+            'formatter': 'json_formatter' if JSON_LOG else 'plain_console',
+        }
     }
     if CONSOLE_LOG
     else {},
+    'root': {'handlers': DEFAULT_LOG_HANDLER, 'level': LOG_LEVEL},
     'loggers': {
-        'django_structlog': {'handlers': DEFAULT_LOG_HANDLER, 'level': LOG_LEVEL},
-        'inventree': {'handlers': DEFAULT_LOG_HANDLER, 'level': LOG_LEVEL},
+        'django_structlog': {'level': LOG_LEVEL},
+        'inventree': {'level': LOG_LEVEL},
     },
 }
 
@@ -234,6 +271,7 @@ PLUGIN_TESTING_SETUP = get_setting(
 PLUGIN_TESTING_EVENTS = False  # Flag if events are tested right now
 PLUGIN_TESTING_EVENTS_ASYNC = False  # Flag if events are tested asynchronously
 PLUGIN_TESTING_RELOAD = False  # Flag if plugin reloading is in testing (check_reload)
+SETUP_INITIALIZING = os.environ.get('SETUP_INITIALIZING', '0') == '1'
 
 # Plugin development settings
 PLUGIN_DEV_SLUG = get_setting('INVENTREE_PLUGIN_DEV_SLUG', 'plugin_dev.slug')
@@ -245,9 +283,6 @@ PLUGIN_DEV_HOST = get_setting(
 PLUGIN_RETRY = get_setting(
     'INVENTREE_PLUGIN_RETRY', 'PLUGIN_RETRY', 3, typecast=int
 )  # How often should plugin loading be tried?
-
-# Hash of the plugin file (will be updated on each change)
-PLUGIN_FILE_HASH = ''
 
 STATICFILES_DIRS = []
 
@@ -270,6 +305,9 @@ if DEBUG and 'collectstatic' not in sys.argv:
 DBBACKUP_DATE_FORMAT = InvenTree.backup.backup_date_format()
 DBBACKUP_FILENAME_TEMPLATE = InvenTree.backup.backup_filename_template()
 DBBACKUP_MEDIA_FILENAME_TEMPLATE = InvenTree.backup.backup_media_filename_template()
+
+# How many backup files to keep
+DBBACKUP_CLEANUP_KEEP = InvenTree.backup.backup_keep_count()
 
 DBBACKUP_GPG_RECIPIENT = InvenTree.backup.backup_gpg_recipient()
 
@@ -316,11 +354,13 @@ INSTALLED_APPS = [
     'order.apps.OrderConfig',
     'part.apps.PartConfig',
     'report.apps.ReportConfig',
+    'scim.apps.ScimConfig',
     'stock.apps.StockConfig',
     'users.apps.UsersConfig',
     'machine.apps.MachineConfig',
     'data_exporter.apps.DataExporterConfig',
     'importer.apps.ImporterConfig',
+    'pricing.apps.PricingConfig',
     'web',
     'generic',
     'InvenTree.apps.InvenTreeConfig',  # InvenTree app runs last
@@ -365,6 +405,10 @@ INSTALLED_APPS = [
     'django_mailbox',  # For email import
     'anymail',  # For email sending/receiving via ESPs
     'storages',
+    'auditlog',  # Audit log / model change history (see 'audit' app)
+    # New InvenTree apps are appended here, so that existing ContentType IDs
+    # match between existing databases and freshly migrated (test) databases
+    'audit.apps.AuditConfig',
 ]
 
 MIDDLEWARE = CONFIG.get(
@@ -386,15 +430,43 @@ MIDDLEWARE = CONFIG.get(
         'django.middleware.clickjacking.XFrameOptionsMiddleware',
         'InvenTree.middleware.AuthRequiredMiddleware',
         'InvenTree.middleware.Check2FAMiddleware',  # Check if the user should be forced to use MFA
-        'oauth2_provider.middleware.OAuth2TokenMiddleware',  # oauth2_provider
         'maintenance_mode.middleware.MaintenanceModeMiddleware',
         'InvenTree.middleware.InvenTreeExceptionProcessor',  # Error reporting
         'InvenTree.middleware.InvenTreeRequestCacheMiddleware',  # Request caching
         'InvenTree.middleware.InvenTreeHostSettingsMiddleware',  # Ensuring correct hosting/security settings
         'django_structlog.middlewares.RequestMiddleware',  # Structured logging
+        'audit.middleware.InvenTreeAuditlogMiddleware',  # Audit log context (after maintenance + request ID)
         'InvenTree.middleware.InvenTreeVersionHeaderMiddleware',
     ],
 )
+
+# The audit log middleware is required for audit entries to record the user (and request context).
+# MIDDLEWARE may be overridden via the config file - ensure that it is always present
+MIDDLEWARE = ensure_middleware(
+    MIDDLEWARE,
+    'audit.middleware.InvenTreeAuditlogMiddleware',
+    after='django_structlog.middlewares.RequestMiddleware',
+)
+
+# OAuth2 tokens must only be handled by the API authentication class (which enforces token scopes)
+# The oauth2_provider middleware would turn a token into a full (session) user login - ensure that it is never present
+MIDDLEWARE = ensure_removed(
+    MIDDLEWARE, 'oauth2_provider.middleware.OAuth2TokenMiddleware', 'MIDDLEWARE'
+)
+
+# Audit log configuration (django-auditlog)
+# Ref: https://django-auditlog.readthedocs.io/en/latest/usage.html#settings
+# Note: AUDITLOG_LOGENTRY_MODEL is a swappable model, and must not be changed once migrations have been applied
+AUDITLOG_LOGENTRY_MODEL = 'audit.AuditLogEntry'
+AUDITLOG_STORE_JSON_CHANGES = True  # Store values as JSON types, rather than strings
+AUDITLOG_DISABLE_ON_RAW_SAVE = True  # Do not log fixture loading / raw saves
+AUDITLOG_CID_HEADER = None  # Correlation ID is provided by AUDITLOG_CID_GETTER (below)
+AUDITLOG_CID_GETTER = 'audit.context.get_cid'  # Matches the structlog request ID
+
+# The upstream auditlog migrations only define the (swapped out) LogEntry model,
+# and do not mark it as swappable - so would create an unused 'auditlog_logentry' table.
+# Disable them entirely - the 'audit' app provides the migrations for AuditLogEntry.
+MIGRATION_MODULES = {'auditlog': None}
 
 # In DEBUG mode, add support for django-silk
 # Ref: https://silk.readthedocs.io/en/latest/
@@ -440,7 +512,6 @@ QUERYCOUNT = {
 
 
 default_auth_backends = [
-    'oauth2_provider.backends.OAuth2Backend',  # OAuth2 provider
     'django.contrib.auth.backends.RemoteUserBackend',  # proxy login
     'django.contrib.auth.backends.ModelBackend',
     'allauth.account.auth_backends.AuthenticationBackend',  # SSO login via external providers
@@ -451,6 +522,13 @@ AUTHENTICATION_BACKENDS = (
     CONFIG.get('authentication_backends', default_auth_backends)
     if CONFIG
     else default_auth_backends
+)
+
+# The oauth2_provider backend accepts an OAuth2 token for *any* authentication attempt (e.g. a login form) - ensure that it is never present
+AUTHENTICATION_BACKENDS = ensure_removed(
+    AUTHENTICATION_BACKENDS,
+    'oauth2_provider.backends.OAuth2Backend',
+    'AUTHENTICATION_BACKENDS',
 )
 
 # LDAP support
@@ -466,10 +544,7 @@ if LDAP_AUTH:  # pragma: no cover
     if LDAP_DEBUG:
         if 'loggers' not in LOGGING:
             LOGGING['loggers'] = {}
-        LOGGING['loggers']['django_auth_ldap'] = {
-            'level': 'DEBUG',
-            'handlers': DEFAULT_LOG_HANDLER,
-        }
+        LOGGING['loggers']['django_auth_ldap'] = {'level': 'DEBUG'}
 
     # Determine LDAP settings
     ldap_settings = ldap.get_ldap_config(debug=LDAP_DEBUG)
@@ -502,6 +577,7 @@ TEMPLATES = [
                         'plugin.template.PluginTemplateLoader',
                         'django.template.loaders.filesystem.Loader',
                         'django.template.loaders.app_directories.Loader',
+                        'InvenTree.template.InvenTreeStorageTemplateLoader',
                     ],
                 )
             ],
@@ -514,7 +590,7 @@ REST_FRAMEWORK = {
     'DATETIME_FORMAT': '%Y-%m-%d %H:%M',
     'DEFAULT_AUTHENTICATION_CLASSES': [
         'users.authentication.ApiTokenAuthentication',
-        'rest_framework.authentication.BasicAuthentication',
+        'users.authentication.InvenTreeBasicAuthentication',
         'rest_framework.authentication.SessionAuthentication',
         'users.authentication.ExtendedOAuth2Authentication',
     ],
@@ -608,8 +684,15 @@ SENTRY_SAMPLE_RATE = float(
     get_setting('INVENTREE_SENTRY_SAMPLE_RATE', 'sentry_sample_rate', 0.1)
 )
 
+# Whether to include PII (e.g. user id/email, IP address, request data) in reported events
+SENTRY_SEND_PII = get_boolean_setting(
+    'INVENTREE_SENTRY_SEND_PII', 'sentry_send_pii', False
+)
+
 if SENTRY_ENABLED and SENTRY_DSN and not TESTING:  # pragma: no cover
-    init_sentry(SENTRY_DSN, SENTRY_SAMPLE_RATE, inventree_tags)
+    init_sentry(
+        SENTRY_DSN, SENTRY_SAMPLE_RATE, inventree_tags, send_pii=SENTRY_SEND_PII
+    )
 
 # OpenTelemetry tracing
 TRACING_ENABLED = (
@@ -620,6 +703,7 @@ TRACING_ENABLED = (
 TRACING_DETAILS: Optional[dict] = tracing.configure_tracing(
     DB_ENGINE, TRACING_ENABLED, inventree_tags
 )
+MIDDLEWARE = ensure_otel_middleware(MIDDLEWARE)
 
 # Cache configuration
 GLOBAL_CACHE_ENABLED = is_global_cache_enabled()
@@ -763,7 +847,7 @@ if SITE_URL:
         validator = URLValidator()
         validator(SITE_URL)
     except Exception:
-        msg = f"Invalid SITE_URL value: '{SITE_URL}'. InvenTree server cannot start."
+        msg = f"Invalid SITE_URL value: '{SITE_URL}'. InvenTree server cannot start.{invalid_site_url_hint(SITE_URL)}"
         logger.error(msg)
         print(msg)
         sys.exit(-1)
@@ -779,11 +863,6 @@ SITE_MULTI = get_boolean_setting('INVENTREE_SITE_MULTI', 'site_multi', False)
 
 # If a SITE_ID is specified
 SITE_ID = get_setting('INVENTREE_SITE_ID', 'site_id', 1 if SITE_MULTI else None)
-
-# Load the allauth social backends
-SOCIAL_BACKENDS = get_setting(
-    'INVENTREE_SOCIAL_BACKENDS', 'social_backends', [], typecast=list
-)
 
 if not SITE_MULTI:
     INSTALLED_APPS.remove('django.contrib.sites')
@@ -841,7 +920,9 @@ if DEBUG:
         'http://localhost',
         'http://*.localhost',
         'http://*localhost:8000',
+        'http://localhost:4173',
         'http://*localhost:4173',
+        'http://localhost:5173',
         'http://*localhost:5173',
     ]:
         if origin not in CSRF_TRUSTED_ORIGINS:
@@ -980,19 +1061,22 @@ else:
 FRONTEND_SETTINGS = config.get_frontend_settings(debug=DEBUG)
 FRONTEND_URL_BASE = FRONTEND_SETTINGS['base_url']
 
+# Load the allauth social backends
+SOCIAL_BACKENDS = get_setting(
+    'INVENTREE_SOCIAL_BACKENDS', 'social_backends', [], typecast=list
+)
+
+DEFAULT_SOCIAL = ['saml', 'openid_connect']
+
 # region auth
-for app in SOCIAL_BACKENDS:  # pragma: no cover
-    # Ensure that the app starts with 'allauth.socialaccount.providers'
-    social_prefix = 'allauth.socialaccount.providers.'
+INSTALLED_APPS.extend(config.get_social_backends(DEFAULT_SOCIAL, SOCIAL_BACKENDS))
 
-    if not app.startswith(social_prefix):
-        app = social_prefix + app
-
-    INSTALLED_APPS.append(app)
-
-SOCIALACCOUNT_PROVIDERS = get_setting(
+SOCIALACCOUNT_PROVIDERS = {a: {} for a in DEFAULT_SOCIAL}
+_PROVIDER_SETTINGS = get_setting(
     'INVENTREE_SOCIAL_PROVIDERS', 'social_providers', None, typecast=dict
 )
+if _PROVIDER_SETTINGS and isinstance(_PROVIDER_SETTINGS, dict):
+    SOCIALACCOUNT_PROVIDERS.update(_PROVIDER_SETTINGS)
 
 SOCIALACCOUNT_STORE_TOKENS = True
 
@@ -1012,13 +1096,11 @@ USERSESSIONS_TRACK_ACTIVITY = True
 # allauth rate limiting: https://docs.allauth.org/en/latest/account/rate_limits.html
 # The default login rate limit is "5/m/user,5/m/ip,5/m/key"
 login_attempts = get_setting('INVENTREE_LOGIN_ATTEMPTS', 'login_attempts', 5)
-
 try:
-    login_attempts = int(login_attempts)
-    login_attempts = f'{login_attempts}/m,{login_attempts}/m'
+    # Only the per-account ('key') limit is user-configurable with an int - use a str for more custom limits
+    login_attempts = f'10/m/ip,{int(login_attempts)}/m/key'
 except ValueError:  # pragma: no cover
     pass
-
 ACCOUNT_RATE_LIMITS = {'login_failed': login_attempts}
 
 # Default protocol for login
@@ -1157,7 +1239,7 @@ FLAGS = {
     'NEXT_GEN': [
         {'condition': 'parameter', 'value': 'ngen='}
     ],  # Should next-gen features be turned on?
-    'OIDC': [{'condition': 'parameter', 'value': 'oidc='}],
+    'OIDC': [{'condition': 'boolean', 'value': True}],
 }
 
 # Get custom flags from environment/yaml
@@ -1185,11 +1267,18 @@ OAUTH2_PROVIDER = {
     # OIDC
     'OIDC_ENABLED': True,
     'OIDC_RSA_PRIVATE_KEY': get_oidc_private_key(),
-    'PKCE_REQUIRED': False,
+    'PKCE_REQUIRED': True,
 }
 OAUTH2_CHECK_EXCLUDED = [  # This setting mutes schema checks for these rule/method combinations
     '/api/email/generate/:post',
     '/api/webhook/{endpoint}/:post',
+    # API token management is not available to OAuth2 tokens
+    '/api/user/token/:get',
+    '/api/user/me/token/:get',
+    '/api/user/tokens/:get',
+    '/api/user/tokens/:post',
+    '/api/user/tokens/{id}/:get',
+    '/api/user/tokens/{id}/:delete',
 ]
 
 if SITE_URL and not TESTING:  # pragma: no cover

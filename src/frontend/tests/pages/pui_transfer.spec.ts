@@ -86,7 +86,7 @@ test('Transfer Order - Reference', async ({ browser }) => {
   await page.getByText('Item Created').waitFor();
 
   // go back to stock page
-  await page.getByRole('link', { name: 'Stock', exact: true }).click();
+  await page.getByRole('tab', { name: 'Stock', exact: true }).click();
   await page
     .getByRole('button', { name: 'action-button-add-transfer-' })
     .click();
@@ -108,10 +108,18 @@ test('Transfer Order - Calendar', async ({ browser }) => {
   await navigate(page, 'stock/location/index/transfer-orders');
   await activateCalendarView(page);
 
-  // Export calendar data
+  // Export calendar data - assert on download instead of notification
   await page.getByLabel('calendar-export-data').click();
-  await page.getByRole('button', { name: 'Export', exact: true }).click();
-  await page.getByText('Process completed successfully').waitFor();
+
+  await page.bringToFront();
+
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('button', { name: 'Export', exact: true }).click()
+  ]);
+  expect(download.suggestedFilename()).toMatch(
+    /InvenTree_TransferOrder.*\.csv$/i
+  );
 
   // Required because we downloaded a file
   await page.context().close();

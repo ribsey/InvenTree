@@ -27,6 +27,9 @@ import {
 import InstanceDetail from '../../components/nav/InstanceDetail';
 import { PageDetail } from '../../components/nav/PageDetail';
 import AttachmentPanel from '../../components/panels/AttachmentPanel';
+import HistoryPanel, {
+  useShowHistoryPanel
+} from '../../components/panels/HistoryPanel';
 import NotesPanel from '../../components/panels/NotesPanel';
 import { PanelGroup } from '../../components/panels/PanelGroup';
 import ParametersPanel from '../../components/panels/ParametersPanel';
@@ -41,6 +44,7 @@ import {
   useEditApiFormModal
 } from '../../hooks/UseForm';
 import { useInstance } from '../../hooks/UseInstance';
+import { useInstanceInfo } from '../../hooks/UseInstanceInfo';
 import { useUserState } from '../../states/UserState';
 import SalesOrderAllocationTable from '../../tables/sales/SalesOrderAllocationTable';
 import { SalesOrderShipmentDetailsPanel } from './SalesOrderShipmentDetailsPanel';
@@ -65,8 +69,15 @@ export default function SalesOrderShipmentDetail() {
     }
   });
 
+  const { instanceInfo } = useInstanceInfo({
+    modelType: ModelType.salesordershipment,
+    modelId: shipment?.pk
+  });
+
   const isPending = useMemo(() => !shipment.shipment_date, [shipment]);
   const isChecked = useMemo(() => !!shipment.checked_by, [shipment]);
+
+  const showHistory = useShowHistoryPanel();
 
   const shipmentPanels: PanelType[] = useMemo(() => {
     return [
@@ -98,19 +109,26 @@ export default function SalesOrderShipmentDetail() {
       },
       ParametersPanel({
         model_type: ModelType.salesordershipment,
-        model_id: shipment.pk
+        model_id: shipment.pk,
+        parameter_count: instanceInfo.parameter_count
       }),
       AttachmentPanel({
         model_type: ModelType.salesordershipment,
-        model_id: shipment.pk
+        model_id: shipment.pk,
+        attachment_count: instanceInfo.attachment_count
       }),
       NotesPanel({
         model_type: ModelType.salesordershipment,
         model_id: shipment.pk,
-        has_note: !!shipment.notes
+        note_count: instanceInfo.note_count
+      }),
+      HistoryPanel({
+        model_type: ModelType.salesordershipment,
+        model_id: shipment.pk,
+        visible: showHistory
       })
     ];
-  }, [isPending, shipment]);
+  }, [isPending, shipment, instanceInfo, showHistory]);
 
   const editShipmentFields = useSalesOrderShipmentFields({
     pending: isPending,
@@ -122,7 +140,6 @@ export default function SalesOrderShipmentDetail() {
     pk: shipment.pk,
     fields: editShipmentFields,
     title: t`Edit Shipment`,
-    queryParams: new URLSearchParams({ tags: 'true' }),
     onFormSuccess: refreshShipment
   });
 
@@ -160,30 +177,35 @@ export default function SalesOrderShipmentDetail() {
       <DetailsBadge
         key='pending'
         label={t`Pending`}
+        tooltip={t`This shipment has not yet been sent`}
         color='gray'
         visible={isPending}
       />,
       <DetailsBadge
         key='checked'
         label={t`Checked`}
+        tooltip={t`This shipment has been checked`}
         color='green'
         visible={isPending && isChecked}
       />,
       <DetailsBadge
         key='not-checked'
         label={t`Not Checked`}
+        tooltip={t`This shipment has not been checked`}
         color='red'
         visible={isPending && !isChecked}
       />,
       <DetailsBadge
         key='shipped'
         label={t`Shipped`}
+        tooltip={t`This shipment has been sent`}
         color='green'
         visible={!isPending}
       />,
       <DetailsBadge
         key='delivered'
         label={t`Delivered`}
+        tooltip={t`This shipment has been delivered`}
         color='blue'
         visible={!!shipment.delivery_date}
       />
@@ -266,6 +288,8 @@ export default function SalesOrderShipmentDetail() {
       >
         <Stack gap='xs'>
           <PageDetail
+            model={ModelType.salesordershipment}
+            id={shipment.pk}
             title={`${t`Sales Order Shipment`}: ${shipment.reference}`}
             subtitle={`${t`Sales Order`}: ${shipment.order_detail?.reference}`}
             breadcrumbs={[

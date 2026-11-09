@@ -1,18 +1,21 @@
 import { Group, Paper, Space, Stack, Text } from '@mantine/core';
 
 import { StylishText } from '@lib/components/StylishText';
+import type { ModelType, PluginPanelKey } from '@lib/enums/ModelType';
 import { useInvenTreeHotkeys } from '@lib/functions/Events';
 import { shortenString } from '@lib/functions/String';
 import { t } from '@lingui/core/macro';
 import { Fragment, type ReactNode, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router-dom';
+import { useDetailNavigation } from '../../hooks/UseDetailNavigation';
 import { usePluginUIFeature } from '../../hooks/UsePluginUIFeature';
 import { useUserSettingsState } from '../../states/SettingsStates';
 import PrimaryActionButton from '../buttons/PrimaryActionButton';
 import { ApiImage } from '../images/ApiImage';
 import { ApiIcon } from '../items/ApiIcon';
 import type { PrimaryActionUIFeature } from '../plugins/PluginUIFeatureTypes';
-import { type Breadcrumb, BreadcrumbList } from './BreadcrumbList';
+import type { Breadcrumb } from './BreadcrumbList';
+import { PageDetailNavigationBar } from './PageDetailNavigationBar';
 import PageTitle from './PageTitle';
 
 interface PageDetailInterface {
@@ -28,13 +31,16 @@ interface PageDetailInterface {
   actions?: ReactNode[];
   editAction?: () => void;
   editEnabled?: boolean;
+  model?: ModelType | PluginPanelKey;
+  id?: number | string | null;
 }
 
 /**
  * Construct a "standard" page detail for common display between pages.
  *
  * @param breadcrumbs - The breadcrumbs to display (optional)
- * @param
+ * @param model - The model type (or plugin panel key) for this page, passed to plugin primary actions (optional)
+ * @param id - The primary key of the instance displayed on this page, passed to plugin primary actions (optional)
  */
 export function PageDetail({
   title,
@@ -48,11 +54,14 @@ export function PageDetail({
   breadcrumbAction,
   actions,
   editAction,
-  editEnabled
+  editEnabled,
+  model,
+  id
 }: Readonly<PageDetailInterface>) {
   const userSettings = useUserSettingsState();
   const navigate = useNavigate();
   const location = useLocation();
+  const detailNavigation = useDetailNavigation();
 
   useInvenTreeHotkeys([
     [
@@ -99,7 +108,11 @@ export function PageDetail({
 
   const extraActions = usePluginUIFeature<PrimaryActionUIFeature>({
     featureType: 'primary_action',
-    context: { location: location.pathname }
+    context: {
+      location: location.pathname,
+      target_model: model,
+      target_id: id
+    }
   });
 
   // action caching
@@ -123,23 +136,30 @@ export function PageDetail({
           leftSection={<ApiIcon name={icon as string} />}
           color={options?.color}
           onClick={click}
-          key={title}
+          key={`plugin-action-${title}`}
         />
       );
     });
-    return [...(extraActionArray ?? []), ...(actions ?? [])];
+
+    // Wrap page actions with stable keys which are independent of the plugin actions.
+    // Plugin actions are loaded asynchronously - if keyed by overall index, the page
+    // actions would be remounted when the plugin actions arrive (closing any open menus).
+    const pageActionArray: ReactNode[] = (actions ?? []).map((action, idx) => (
+      <Fragment key={`page-action-${idx}`}>{action}</Fragment>
+    ));
+
+    return [...extraActionArray, ...pageActionArray];
   }, [extraActions, actions]);
 
   return (
     <>
       <PageTitle title={pageTitleString} />
       <Stack gap='xs'>
-        {computedBreadcrumbs && computedBreadcrumbs.length > 0 && (
-          <BreadcrumbList
-            navCallback={breadcrumbAction}
-            breadcrumbs={computedBreadcrumbs}
-          />
-        )}
+        <PageDetailNavigationBar
+          breadcrumbAction={breadcrumbAction}
+          breadcrumbs={computedBreadcrumbs ?? []}
+          detailNavigation={detailNavigation}
+        />
         <Paper p='xs' radius='xs' shadow='xs'>
           <Group
             justify='space-between'
@@ -184,11 +204,9 @@ export function PageDetail({
                 </Group>
               )}
             </Group>
-            {computedActions && (
-              <Group gap={5} justify='right' wrap='nowrap' align='flex-start'>
-                {computedActions.map((action, idx) => (
-                  <Fragment key={idx}>{action}</Fragment>
-                ))}
+            {computedActions.length > 0 && (
+              <Group gap={5} justify='right' wrap='nowrap' align='center'>
+                {computedActions.map((action) => action)}
               </Group>
             )}
           </Group>

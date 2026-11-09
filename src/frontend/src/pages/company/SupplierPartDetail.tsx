@@ -27,6 +27,9 @@ import {
 import InstanceDetail from '../../components/nav/InstanceDetail';
 import { PageDetail } from '../../components/nav/PageDetail';
 import AttachmentPanel from '../../components/panels/AttachmentPanel';
+import HistoryPanel, {
+  useShowHistoryPanel
+} from '../../components/panels/HistoryPanel';
 import NotesPanel from '../../components/panels/NotesPanel';
 import { PanelGroup } from '../../components/panels/PanelGroup';
 import ParametersPanel from '../../components/panels/ParametersPanel';
@@ -37,6 +40,7 @@ import {
   useEditApiFormModal
 } from '../../hooks/UseForm';
 import { useInstance } from '../../hooks/UseInstance';
+import { useInstanceInfo } from '../../hooks/UseInstanceInfo';
 import { useUserState } from '../../states/UserState';
 import { PurchaseOrderTable } from '../../tables/purchasing/PurchaseOrderTable';
 import SupplierPriceBreakTable from '../../tables/purchasing/SupplierPriceBreakTable';
@@ -65,6 +69,13 @@ export default function SupplierPartDetail() {
       tags: true
     }
   });
+
+  const { instanceInfo } = useInstanceInfo({
+    modelType: ModelType.supplierpart,
+    modelId: supplierPart?.pk
+  });
+
+  const showHistory = useShowHistoryPanel();
 
   const panels: PanelType[] = useMemo(() => {
     return [
@@ -119,19 +130,26 @@ export default function SupplierPartDetail() {
       },
       ParametersPanel({
         model_type: ModelType.supplierpart,
-        model_id: supplierPart?.pk
+        model_id: supplierPart?.pk,
+        parameter_count: instanceInfo.parameter_count
       }),
       AttachmentPanel({
         model_type: ModelType.supplierpart,
-        model_id: supplierPart?.pk
+        model_id: supplierPart?.pk,
+        attachment_count: instanceInfo.attachment_count
       }),
       NotesPanel({
         model_type: ModelType.supplierpart,
         model_id: supplierPart?.pk,
-        has_note: !!supplierPart?.notes
+        note_count: instanceInfo.note_count
+      }),
+      HistoryPanel({
+        model_type: ModelType.supplierpart,
+        model_id: supplierPart?.pk,
+        visible: showHistory
       })
     ];
-  }, [supplierPart]);
+  }, [supplierPart, instanceInfo, showHistory]);
 
   const supplierPartActions = useMemo(() => {
     return [
@@ -169,7 +187,6 @@ export default function SupplierPartDetail() {
     pk: supplierPart?.pk,
     title: t`Edit Supplier Part`,
     fields: supplierPartFields,
-    queryParams: new URLSearchParams({ tags: 'true' }),
     onFormSuccess: refreshInstance
   });
 
@@ -214,11 +231,13 @@ export default function SupplierPartDetail() {
     return [
       <DetailsBadge
         label={t`Inactive`}
+        tooltip={t`This supplier part is inactive`}
         color='red'
         visible={supplierPart.active == false}
       />,
       <DetailsBadge
         label={`${t`In Stock`}: ${formatDecimal(supplierPart.in_stock)}`}
+        tooltip={t`Quantity of this supplier part in stock`}
         color={'green'}
         visible={
           supplierPart?.active &&
@@ -229,12 +248,14 @@ export default function SupplierPartDetail() {
       />,
       <DetailsBadge
         label={t`No Stock`}
+        tooltip={t`There is no stock available for this supplier part`}
         color={'red'}
         visible={supplierPart.active && supplierPart.in_stock == 0}
         key='no_stock'
       />,
       <DetailsBadge
         label={`${t`On Order`}: ${formatDecimal(supplierPart.on_order)}`}
+        tooltip={t`Quantity on order from outstanding purchase orders`}
         color='blue'
         visible={supplierPart.on_order > 0}
         key='on_order'
@@ -253,6 +274,8 @@ export default function SupplierPartDetail() {
       >
         <Stack gap='xs'>
           <PageDetail
+            model={ModelType.supplierpart}
+            id={supplierPart.pk}
             title={t`Supplier Part`}
             subtitle={`${supplierPart.SKU} - ${supplierPart?.part_detail?.name}`}
             breadcrumbs={breadcrumbs}

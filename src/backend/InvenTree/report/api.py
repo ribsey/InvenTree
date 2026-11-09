@@ -226,6 +226,7 @@ class LabelPrint(GenericAPIView):
             output.pk,
             user.pk if user else None,
             plugin.slug,
+            retry=False,
             options=(plugin_serializer.data if plugin_serializer else {}),
         )
 
@@ -372,6 +373,9 @@ class ReportAssetList(TemplatePermissionMixin, ListCreateAPI):
 
     queryset = report.models.ReportAsset.objects.all()
     serializer_class = report.serializers.ReportAssetSerializer
+    filter_backends = SEARCH_ORDER_FILTER
+    search_fields = ['description']
+    ordering_fields = ['description']
 
 
 class ReportAssetDetail(TemplatePermissionMixin, RetrieveUpdateDestroyAPI):

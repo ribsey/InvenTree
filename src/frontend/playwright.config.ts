@@ -1,7 +1,22 @@
+import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { defineConfig, devices } from '@playwright/test';
+
+import { mockOidcPort, mockSsoUser } from './tests/defaults';
 
 // Detect if running in CI
 const IS_CI = !!process.env.CI;
+
+/* Historical test durations used to balance CI shards by runtime (not test count).
+ * Refresh from flakiness.io (run from src/frontend):
+ *   CI=1 npx flakiness-playwright-timings fetch -o playwright/timings.json
+ */
+const TIMINGS_FILE: string = path.join(
+  path.dirname(fileURLToPath(import.meta.url)),
+  'playwright',
+  'timings.json'
+);
 
 /* We optionally spin-up services based on the testing mode:
  *
@@ -47,7 +62,13 @@ export default defineConfig({
         ['html', { open: 'never' }],
         ['blob'],
         ['github'],
-        ['@flakiness/playwright', { flakinessProject: 'InvenTree/InvenTree' }]
+        [
+          '@flakiness/playwright',
+          {
+            flakinessProject: 'InvenTree/InvenTree',
+            shardBalancing: { timingsFile: TIMINGS_FILE }
+          }
+        ]
       ]
     : 'list',
 
@@ -79,6 +100,23 @@ export default defineConfig({
       stderr: 'pipe',
       timeout: 120 * 1000
     },
+    // Mock OIDC provider - see tests/pui_sso.spec.ts
+    {
+      command: 'node ./playwright/mock-oidc-server.mjs',
+      env: {
+        MOCK_OIDC_PORT: String(mockOidcPort),
+        MOCK_OIDC_SUB: mockSsoUser.sub,
+        MOCK_OIDC_USERNAME: mockSsoUser.username,
+        MOCK_OIDC_EMAIL: mockSsoUser.email,
+        MOCK_OIDC_FIRST_NAME: mockSsoUser.firstName,
+        MOCK_OIDC_LAST_NAME: mockSsoUser.lastName
+      },
+      url: `http://localhost:${mockOidcPort}/.well-known/openid-configuration`,
+      reuseExistingServer: IS_CI,
+      stdout: 'pipe',
+      stderr: 'pipe',
+      timeout: 60 * 1000
+    },
     {
       command: 'invoke dev.server -a 0.0.0.0:8000',
       env: {
@@ -93,7 +131,27 @@ export default defineConfig({
         INVENTREE_LOGIN_ATTEMPTS: '3',
         INVENTREE_PLUGINS_MANDATORY: 'samplelocate',
         INVENTREE_CUSTOM_SPLASH: 'img/playwright_custom_splash.png',
-        INVENTREE_CUSTOM_LOGO: 'img/playwright_custom_logo.png'
+        INVENTREE_CUSTOM_LOGO: 'img/playwright_custom_logo.png',
+        // Dummy mail config - only needed to satisfy the "is email
+        // configured" gate on registration/SSO-signup; nothing here ever
+        // needs to actually be delivered, and send failures are swallowed.
+        INVENTREE_EMAIL_HOST: 'localhost',
+        INVENTREE_EMAIL_SENDER: 'noreply@example.org',
+        // Register the mock OIDC provider from above as a real SSO backend
+        INVENTREE_SOCIAL_BACKENDS: 'openid_connect',
+        INVENTREE_SOCIAL_PROVIDERS: JSON.stringify({
+          openid_connect: {
+            APPS: [
+              {
+                provider_id: 'mock',
+                name: 'Mock SSO',
+                client_id: 'playwright-mock-client',
+                secret: 'playwright-mock-secret',
+                settings: { server_url: `http://localhost:${mockOidcPort}` }
+              }
+            ]
+          }
+        })
       },
       url: 'http://localhost:8000/api/',
       reuseExistingServer: IS_CI,

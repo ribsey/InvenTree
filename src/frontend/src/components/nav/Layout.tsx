@@ -21,6 +21,7 @@ import {
   useUserSettingsState
 } from '../../states/SettingsStates';
 import { useUserState } from '../../states/UserState';
+import GlobalFormModals from '../forms/GlobalFormModals';
 import GlobalImporterDrawer from '../importer/GlobalImporterDrawer';
 import { ApiIcon } from '../items/ApiIcon';
 import { useInvenTreeContext } from '../plugins/PluginContext';
@@ -30,6 +31,7 @@ import {
   PluginUIFeatureType
 } from '../plugins/PluginUIFeature';
 import GlobalPreviewDrawer from '../previews/GlobalPreviewDrawer';
+import { FirstUseTour } from './FirstUseTour';
 import { Footer } from './Footer';
 import { Header } from './Header';
 
@@ -123,6 +125,7 @@ export default function LayoutComponent() {
   return (
     <ProtectedRoute>
       <>
+        <FirstUseTour />
         <Flex direction='column' mih='100vh'>
           <Header />
           <Container className={classes.layoutContent} size='100%'>
@@ -149,6 +152,7 @@ export default function LayoutComponent() {
           )}
         </Flex>
         <GlobalImporterDrawer />
+        <GlobalFormModals />
         <GlobalPreviewDrawer />
       </>
     </ProtectedRoute>

@@ -22,7 +22,6 @@ import { useDebouncedValue } from '@mantine/hooks';
 import {
   IconAlertCircle,
   IconBackspace,
-  IconExclamationCircle,
   IconRefresh,
   IconSearch,
   IconSettings,
@@ -31,7 +30,7 @@ import {
 } from '@tabler/icons-react';
 import { useQuery } from '@tanstack/react-query';
 import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
-import { type NavigateFunction, useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 
 import { Boundary } from '@lib/components/Boundary';
 import { ApiEndpoints } from '@lib/enums/ApiEndpoints';
@@ -40,18 +39,18 @@ import { ModelType } from '@lib/enums/ModelType';
 import { UserRoles } from '@lib/enums/Roles';
 import { apiUrl } from '@lib/functions/Api';
 import { cancelEvent } from '@lib/functions/Events';
-import {
-  eventModified,
-  getDetailUrl,
-  navigateToLink
-} from '@lib/functions/Navigation';
-import { showNotification } from '@mantine/notifications';
+import { eventModified, getDetailUrl } from '@lib/functions/Navigation';
 import { api } from '../../App';
 import { openGlobalPreview } from '../../states/PreviewDrawerState';
 import { useUserSettingsState } from '../../states/SettingsStates';
 import { useUserState } from '../../states/UserState';
 import { RenderInstance } from '../render/Instance';
 import { getModelInfo } from '../render/ModelType';
+
+// Minimum number of characters required before firing a (non-regex) search query.
+// Very short terms match broadly against every searched field across every model,
+// which is expensive to compute and rarely useful to the user.
+const MIN_SEARCH_LENGTH = 2;
 
 // Define type for handling individual search queries
 type SearchQuery = {
@@ -70,17 +69,17 @@ type SearchQuery = {
 function QueryResultGroup({
   searchText,
   query,
-  navigate,
   onClose,
   onRemove,
-  onResultClick
+  onResultClick,
+  searchNotes
 }: Readonly<{
   searchText: string;
   query: SearchQuery;
-  navigate: NavigateFunction;
   onClose: () => void;
   onRemove: (query: ModelType) => void;
   onResultClick: (query: ModelType, pk: number, event: any) => void;
+  searchNotes: boolean;
 }>) {
   const modelInfo = useMemo(() => getModelInfo(query.model), [query.model]);
 
@@ -93,30 +92,28 @@ function QueryResultGroup({
     return modelInfo.url_overview;
   }, [query, modelInfo]);
 
-  // Callback function to view all results for a given query
-  const viewResults = useCallback(
-    (event: any) => {
-      cancelEvent(event);
+  const resultsUrl = useMemo(() => {
+    if (!overviewUrl) {
+      return undefined;
+    }
 
-      if (overviewUrl) {
-        const url = `${overviewUrl}?search=${searchText}`;
+    const params = new URLSearchParams({ search: searchText });
+    if (searchNotes) {
+      params.set('search_notes', 'true');
+    }
 
-        // Close drawer if opening in the same tab
-        if (!eventModified(event)) {
-          onClose();
-        }
+    return `${overviewUrl}?${params.toString()}`;
+  }, [overviewUrl, searchText, searchNotes]);
 
-        navigateToLink(url, navigate, event);
-      } else {
-        showNotification({
-          title: t`No Overview Available`,
-          message: t`No overview available for this model type`,
-          color: 'red',
-          icon: <IconExclamationCircle />
-        });
+  const handleViewAllClick = useCallback(
+    (event: React.MouseEvent<HTMLAnchorElement>) => {
+      event.stopPropagation();
+
+      if (event.button === 0 && !eventModified(event) && !event.altKey) {
+        onClose();
       }
     },
-    [overviewUrl, searchText]
+    [onClose]
   );
 
   if (query.results.count == 0) {
@@ -129,16 +126,33 @@ function QueryResultGroup({
         <Group justify='space-between'>
           <Group justify='left' gap={5} wrap='nowrap'>
             <Tooltip label={t`View all results`} position='top-start'>
-              <ActionIcon
-                size='sm'
-                variant='transparent'
-                radius='xs'
-                aria-label={`view-all-results-${query.searchKey ?? query.model}`}
-                disabled={!overviewUrl}
-                onClick={viewResults}
-              >
-                <IconTableExport />
-              </ActionIcon>
+              {resultsUrl ? (
+                <ActionIcon
+                  renderRoot={(props) => (
+                    <Link
+                      {...props}
+                      to={resultsUrl}
+                      onClick={handleViewAllClick}
+                    />
+                  )}
+                  size='sm'
+                  variant='transparent'
+                  radius='xs'
+                  aria-label={`view-all-results-${query.searchKey ?? query.model}`}
+                >
+                  <IconTableExport />
+                </ActionIcon>
+              ) : (
+                <ActionIcon
+                  size='sm'
+                  variant='transparent'
+                  radius='xs'
+                  aria-label={`view-all-results-${query.searchKey ?? query.model}`}
+                  disabled
+                >
+                  <IconTableExport />
+                </ActionIcon>
+              )}
             </Tooltip>
             <Text size='lg'>{query.title ?? modelInfo.label_multiple}</Text>
             <Text size='sm' style={{ fontStyle: 'italic' }}>
@@ -169,7 +183,8 @@ function QueryResultGroup({
             <Fragment key={`result-group-${query.model}-${result.pk}`}>
               <Anchor
                 underline='never'
-                href={getDetailUrl(query.model, result.pk, true)}
+                component={Link}
+                to={getDetailUrl(query.model, result.pk)}
                 onClick={(event: any) =>
                   onResultClick(query.model, result.pk, event)
                 }
@@ -295,7 +310,7 @@ export function SearchDrawer({
           part_detail: true
         },
         enabled:
-          user.hasViewRole(UserRoles.build) &&
+          user.hasViewVisible(UserRoles.build) &&
           userSettings.isSet('SEARCH_PREVIEW_SHOW_BUILD_ORDERS')
       },
       {
@@ -305,7 +320,7 @@ export function SearchDrawer({
         title: t`Suppliers`,
         parameters: {},
         enabled:
-          user.hasViewRole(UserRoles.purchase_order) &&
+          user.hasViewVisible(UserRoles.purchase_order) &&
           userSettings.isSet('SEARCH_PREVIEW_SHOW_COMPANIES')
       },
       {
@@ -315,7 +330,7 @@ export function SearchDrawer({
         title: t`Manufacturers`,
         parameters: {},
         enabled:
-          user.hasViewRole(UserRoles.purchase_order) &&
+          user.hasViewVisible(UserRoles.purchase_order) &&
           userSettings.isSet('SEARCH_PREVIEW_SHOW_COMPANIES')
       },
       {
@@ -325,7 +340,7 @@ export function SearchDrawer({
         title: t`Customers`,
         parameters: {},
         enabled:
-          user.hasViewRole(UserRoles.sales_order) &&
+          user.hasViewVisible(UserRoles.sales_order) &&
           userSettings.isSet('SEARCH_PREVIEW_SHOW_COMPANIES')
       },
       {
@@ -339,7 +354,7 @@ export function SearchDrawer({
             : undefined
         },
         enabled:
-          user.hasViewRole(UserRoles.purchase_order) &&
+          user.hasViewVisible(UserRoles.purchase_order) &&
           userSettings.isSet('SEARCH_PREVIEW_SHOW_PURCHASE_ORDERS')
       },
       {
@@ -353,14 +368,14 @@ export function SearchDrawer({
             : undefined
         },
         enabled:
-          user.hasViewRole(UserRoles.sales_order) &&
+          user.hasViewVisible(UserRoles.sales_order) &&
           userSettings.isSet('SEARCH_PREVIEW_SHOW_SALES_ORDERS')
       },
       {
         model: ModelType.salesordershipment,
         parameters: {},
         enabled:
-          user.hasViewRole(UserRoles.sales_order) &&
+          user.hasViewVisible(UserRoles.sales_order) &&
           userSettings.isSet('SEARCH_PREVIEW_SHOW_SALES_ORDER_SHIPMENTS')
       },
       {
@@ -374,7 +389,7 @@ export function SearchDrawer({
             : undefined
         },
         enabled:
-          user.hasViewRole(UserRoles.return_order) &&
+          user.hasViewVisible(UserRoles.return_order) &&
           userSettings.isSet('SEARCH_PREVIEW_SHOW_RETURN_ORDERS')
       }
     ];
@@ -385,15 +400,14 @@ export function SearchDrawer({
     return searchQueryList.filter((q) => q.enabled);
   }, [searchQueryList]);
 
-  // Re-fetch data whenever the search term is updated
-  useEffect(() => {
-    searchQuery.refetch();
-  }, [searchText]);
-
   // Function for performing the actual search query
-  const performSearch = async () => {
-    // Return empty result set if no search text
-    if (!searchText) {
+  const performSearch = async ({ signal }: { signal: AbortSignal }) => {
+    // Return empty result set if no search text, or too short to be worth searching on
+    // (a very short term matches broadly against every searched field, and is rarely useful)
+    if (
+      !searchText ||
+      (!searchRegex && searchText.length < MIN_SEARCH_LENGTH)
+    ) {
       return [];
     }
 
@@ -413,7 +427,7 @@ export function SearchDrawer({
     });
 
     return api
-      .post(apiUrl(ApiEndpoints.api_search), params)
+      .post(apiUrl(ApiEndpoints.api_search), params, { signal })
       .then((response) => response.data);
   };
 
@@ -460,12 +474,17 @@ export function SearchDrawer({
     onClose();
   }
 
-  const navigate = useNavigate();
-
   // Callback when one of the search results is clicked
   function onResultClick(query: ModelType, pk: number, event: any) {
     const targetModel = ModelInformationDict[query];
-    if (targetModel.url_detail == undefined) {
+    if (
+      targetModel.url_detail == undefined ||
+      event.button !== 0 ||
+      event.ctrlKey ||
+      event.metaKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
       return;
     }
 
@@ -480,14 +499,7 @@ export function SearchDrawer({
       return;
     }
 
-    if (eventModified(event)) {
-      // Keep the drawer open in this condition
-    } else {
-      closeDrawer();
-    }
-
-    const url = targetModel.url_detail.replace(':pk', pk.toString());
-    navigateToLink(url, navigate, event);
+    closeDrawer();
   }
 
   return (
@@ -581,8 +593,8 @@ export function SearchDrawer({
                   key={query.model}
                   searchText={searchText}
                   query={query}
-                  navigate={navigate}
                   onClose={closeDrawer}
+                  searchNotes={searchNotes}
                   onRemove={(query) => removeResults(query)}
                   onResultClick={(query, pk, event) =>
                     onResultClick(query, pk, event)

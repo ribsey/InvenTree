@@ -13,6 +13,7 @@ _roles = {
     'admin': 'Role Admin',
     'part_category': 'Role Part Categories',
     'part': 'Role Parts',
+    'pricing': 'Role Pricing',
     'stock_location': 'Role Stock Locations',
     'stock': 'Role Stock Items',
     'bom': 'Role Bills of Material',
@@ -33,11 +34,13 @@ calculated = {
 
 
 DEFAULT_READ = get_granular_scope('read', type='g')
+DEFAULT_WRITE = get_granular_scope('write', type='g')
 DEFAULT_STAFF = get_granular_scope('staff', type='a')
 DEFAULT_SUPERUSER = get_granular_scope('superuser', type='a')
 # This is actually used
 oauth2_scopes = {
     DEFAULT_READ: 'General Read scope',
+    DEFAULT_WRITE: 'General Write scope',
     'openid': 'OpenID Connect scope',
     # Admin scopes
     DEFAULT_STAFF: 'User Role Staff',

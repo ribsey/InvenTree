@@ -27,6 +27,9 @@ import {
 import InstanceDetail from '../../components/nav/InstanceDetail';
 import { PageDetail } from '../../components/nav/PageDetail';
 import AttachmentPanel from '../../components/panels/AttachmentPanel';
+import HistoryPanel, {
+  useShowHistoryPanel
+} from '../../components/panels/HistoryPanel';
 import NotesPanel from '../../components/panels/NotesPanel';
 import { PanelGroup } from '../../components/panels/PanelGroup';
 import ParametersPanel from '../../components/panels/ParametersPanel';
@@ -37,6 +40,7 @@ import {
   useEditApiFormModal
 } from '../../hooks/UseForm';
 import { useInstance } from '../../hooks/UseInstance';
+import { useInstanceInfo } from '../../hooks/UseInstanceInfo';
 import useStatusCodes from '../../hooks/UseStatusCodes';
 import { useGlobalSettingsState } from '../../states/SettingsStates';
 import { useUserState } from '../../states/UserState';
@@ -61,6 +65,11 @@ export default function TransferOrderDetail() {
     params: {
       tags: true
     }
+  });
+
+  const { instanceInfo } = useInstanceInfo({
+    modelType: ModelType.transferorder,
+    modelId: order?.pk
   });
 
   const toStatus = useStatusCodes({ modelType: ModelType.transferorder });
@@ -92,6 +101,8 @@ export default function TransferOrderDetail() {
   ) : (
     <TransferOrderDetailsPanel instance={order} />
   );
+
+  const showHistory = useShowHistoryPanel();
 
   const orderPanels: PanelType[] = useMemo(() => {
     return [
@@ -174,18 +185,26 @@ export default function TransferOrderDetail() {
       },
       ParametersPanel({
         model_type: ModelType.transferorder,
-        model_id: order.pk
+        model_id: order.pk,
+        parameter_count: instanceInfo.parameter_count
       }),
       AttachmentPanel({
         model_type: ModelType.transferorder,
-        model_id: order.pk
+        model_id: order.pk,
+        attachment_count: instanceInfo.attachment_count
       }),
       NotesPanel({
         model_type: ModelType.transferorder,
-        model_id: order.pk
+        model_id: order.pk,
+        note_count: instanceInfo.note_count
+      }),
+      HistoryPanel({
+        model_type: ModelType.transferorder,
+        model_id: order.pk,
+        visible: showHistory
       })
     ];
-  }, [order, id, user]);
+  }, [order, id, user, instanceInfo, showHistory]);
 
   const orderBadges: ReactNode[] = useMemo(() => {
     return instanceQuery.isLoading
@@ -210,7 +229,6 @@ export default function TransferOrderDetail() {
     pk: order.pk,
     title: t`Edit Transfer Order`,
     fields: transferOrderFields,
-    queryParams: new URLSearchParams({ tags: 'true' }),
     onFormSuccess: () => {
       refreshInstance();
     }
@@ -363,6 +381,8 @@ export default function TransferOrderDetail() {
       >
         <Stack gap='xs'>
           <PageDetail
+            model={ModelType.transferorder}
+            id={order.pk}
             title={`${t`Transfer Order`}: ${order.reference}`}
             subtitle={subtitle}
             // What should be the Transfer Order image?

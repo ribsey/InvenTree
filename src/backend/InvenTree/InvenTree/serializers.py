@@ -21,7 +21,6 @@ from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 from rest_framework.exceptions import ValidationError
 from rest_framework.fields import empty
-from rest_framework.mixins import ListModelMixin
 from rest_framework.permissions import SAFE_METHODS
 from rest_framework.serializers import DecimalField, Serializer
 from rest_framework.utils import model_meta
@@ -92,8 +91,17 @@ class FilterableSerializerMixin:
     optional_fields: set = None
     filter_on_query: bool = True
 
+    # Keyword argument used to pass the requesting user to nested serializers
+    PERMISSION_USER_KWARG = 'permission_user'
+
     def __init__(self, *args, **kwargs):
         """Initialization routine for the serializer. This gathers and applies filters through kwargs."""
+        # The requesting user, as provided by a parent serializer (if this serializer is nested)
+        # Note: This is used *only* for permission checks against optional fields.
+        # A nested serializer does not receive the request itself,
+        # so that query parameters are only applied to the top-level serializer.
+        self.permission_user = kwargs.pop(self.PERMISSION_USER_KWARG, None)
+
         # Extract some useful context information for later use
         context = kwargs.get('context', {})
         self.request = context.get('request', None) or getattr(self, 'request', None)
@@ -238,7 +246,7 @@ class FilterableSerializerMixin:
         if model in (get_user_model(), Group, Owner, RuleSet):
             return included
 
-        user = getattr(self.request, 'user', None)
+        user = self.get_permission_user()
 
         if user is None:
             return included
@@ -297,7 +305,16 @@ class FilterableSerializerMixin:
 
     def get_field_names(self, declared_fields, info):
         """Remove unused fields before returning field names."""
-        field_names = super().get_field_names(declared_fields, info)
+        # Note: when `Meta.fields` is a list/tuple, DRF's base `get_field_names`
+        # returns that *exact* list object rather than a copy - a single list
+        # shared by every instance of this serializer class, across every thread.
+        # Copy it before mutating below - otherwise concurrent requests that
+        # disagree on whether an OptionalField (e.g. `tags`) should be included
+        # append/remove it on each other's shared list. A request whose own
+        # append lands can still have the field silently removed again by a
+        # concurrent request's `.remove()` before its own field-building loop
+        # (in DRF's `get_fields()`, which iterates this same list) reaches it.
+        field_names = list(super().get_field_names(declared_fields, info))
 
         # Add any optional fields which are included
         for field_name in self.optional_fields:
@@ -311,12 +328,33 @@ class FilterableSerializerMixin:
 
         return field_names
 
+    def get_permission_user(self):
+        """Return the user against which optional field permissions are checked.
+
+        This is the user associated with the request (for a top-level serializer),
+        or the user provided by the parent serializer (for a nested serializer).
+        """
+        if user := getattr(self.request, 'user', None):
+            return user
+
+        return self.permission_user
+
     def build_optional_field(self, field_name: str):
         """Build an optional field, based on the provided field name."""
         field = getattr(self, field_name, None)
 
         if field and isinstance(field, OptionalField):
-            serializer_kwargs = {**field.serializer_kwargs} or {}
+            serializer_kwargs = {**(field.serializer_kwargs or {})}
+
+            # Pass the requesting user through to any nested filterable serializer,
+            # so that it can check permissions for its own optional fields
+            if isinstance(field.serializer_class, type) and issubclass(
+                field.serializer_class, FilterableSerializerMixin
+            ):
+                serializer_kwargs[self.PERMISSION_USER_KWARG] = (
+                    self.get_permission_user()
+                )
+
             return field.serializer_class, serializer_kwargs
 
     def build_relational_field(self, field_name, relation_info):
@@ -685,7 +723,7 @@ class DependentField(serializers.Field):
         """This method tries to convert the data to an internal representation based on the defined to_internal_value method on the child."""
         self.get_child()
         if self.child:
-            return self.child.to_internal_value(data)
+            return self.child.run_validation(data)
 
         return None
 
@@ -992,30 +1030,6 @@ class CustomStatusSerializerMixin(serializers.Serializer):
         )
 
 
-class NotesFieldMixin:
-    """Serializer mixin for handling 'notes' fields.
-
-    The 'notes' field will be hidden in a LIST serializer,
-    but available in a DETAIL serializer.
-    """
-
-    def __init__(self, *args, **kwargs):
-        """Remove 'notes' field from list views."""
-        super().__init__(*args, **kwargs)
-
-        if hasattr(self, 'context'):
-            request = self.context.get('request', None)
-            method = getattr(request, 'method', None)
-
-            if view := self.context.get('view', None):
-                if (
-                    issubclass(view.__class__, ListModelMixin)
-                    and method in SAFE_METHODS
-                    and not InvenTree.ready.isGeneratingSchema()
-                ):
-                    self.fields.pop('notes', None)
-
-
 class ContentTypeField(serializers.ChoiceField):
     """Serializer field which represents a ContentType as 'app_label.model_name'.
 
@@ -1122,19 +1136,13 @@ class DuplicateOptionsSerializer(serializers.Serializer):
             'copy_parameters',
             _('Copy Parameters'),
             _('Copy parameters from the original item'),
-            False,
         ),
-        (
-            'copy_lines',
-            _('Copy Lines'),
-            _('Copy line items from the original order'),
-            False,
-        ),
+        ('copy_notes', _('Copy Notes'), _('Copy notes from the original item')),
+        ('copy_lines', _('Copy Lines'), _('Copy line items from the original order')),
         (
             'copy_extra_lines',
             _('Copy Extra Lines'),
             _('Copy extra line items from the original order'),
-            False,
         ),
     ]
 
@@ -1168,8 +1176,8 @@ class DuplicateOptionsSerializer(serializers.Serializer):
         copy_field_names = [spec['name'] for spec in copy_fields]
 
         # Apply "default" fields
-        for name, label, help_text, default_value in self.DEFAULT_FIELDS:
-            popped_value = kwargs.pop(name, default_value)
+        for name, label, help_text in self.DEFAULT_FIELDS:
+            popped_value = kwargs.pop(name, False)
 
             if name in copy_field_names:
                 # Manually supplied field, continue
@@ -1208,3 +1216,34 @@ class DuplicateOptionsSerializer(serializers.Serializer):
                 label=spec.get('label', spec['name']),
                 help_text=spec.get('help_text', ''),
             )
+
+
+def apply_duplicate_copy_options(
+    instance, duplicate: dict, original, **copy_defaults: bool
+) -> None:
+    """Apply the standard 'copy_<x>' duplicate-options onto a newly duplicated instance.
+
+    Many serializers which support duplication (Part/Company/ManufacturerPart/SupplierPart/
+    Build/PurchaseOrder/SalesOrder/ReturnOrder/TransferOrder/SalesOrderShipment) expose a set
+    of 'copy_<x>' boolean flags (e.g. copy_notes, copy_parameters) which each map onto an
+    identically-named `instance.copy_<x>_from(original)` method. This is the shared dispatch
+    for that convention, so adding a new flag - e.g. a future copy_attachments, once
+    InvenTreeAttachmentMixin grows a copy_attachments_from() method - is a one-line addition
+    at each call site rather than a new copy-pasted `if duplicate.get(...): instance.copy_..._
+    from(...)` block. Any duplicate flag whose target method doesn't follow the
+    copy_<x>_from() naming convention (e.g. Part's copy_bom/copy_image/copy_tests, or
+    StockItem's copy_tests) must still be handled separately by the caller.
+
+    Arguments:
+        instance: The newly created instance to copy data onto
+        duplicate: The validated 'duplicate' options dict - callers are expected to have
+            already checked `if duplicate:` before calling this (and extracted `original`
+            from it), since they still need both to handle their own additional flags
+        original: The source instance to copy data from
+        **copy_defaults: One kwarg per 'copy_<x>' flag to apply, e.g.
+            `copy_notes=True, copy_parameters=True` - the kwarg's value is the default used
+            if that flag isn't present in `duplicate`
+    """
+    for flag, default in copy_defaults.items():
+        if duplicate.get(flag, default):
+            getattr(instance, f'{flag}_from')(original)

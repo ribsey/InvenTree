@@ -2,12 +2,13 @@
 
 import base64
 import os
-import time
 from datetime import datetime, timedelta
 from decimal import Decimal
+from importlib import import_module
 from io import BytesIO
 from pathlib import Path
 from unittest import mock
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 import django.core.exceptions as django_exceptions
@@ -17,11 +18,13 @@ from django.core import mail
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
+from django.db.migrations.recorder import MigrationRecorder
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
 import pint.errors
+import requests_mock
 from djmoney.contrib.exchange.exceptions import MissingRate
 from djmoney.contrib.exchange.models import Rate, convert_money
 from djmoney.money import Money
@@ -39,6 +42,7 @@ import InvenTree.tasks
 from common.currency import currency_codes
 from common.models import CustomUnit, InvenTreeSetting
 from common.settings import get_global_setting
+from InvenTree import apps
 from InvenTree.helpers_mixin import ClassProviderMixin, ClassValidationMixin
 from InvenTree.sanitizer import sanitize_svg
 from InvenTree.unit_test import InvenTreeTestCase, in_env_context
@@ -1042,6 +1046,16 @@ class TestSerialNumberExtraction(TestCase):
         with self.assertRaises(ValidationError):
             e('1,2,3', 5, 1)
 
+        # Test serial number exceeding maximum length
+        with self.assertRaises(ValidationError) as exc:
+            e('1,' + 'x' * 101, 2, 1)
+
+        self.assertIn('Serial number exceeds maximum length', str(exc.exception))
+
+        # Generated serials are also checked
+        with self.assertRaises(ValidationError):
+            e('x' * 100 + '9+', 2, 1)
+
         # Test empty string
         with self.assertRaises(ValidationError):
             e(', , ,', 0, 1)
@@ -1171,8 +1185,26 @@ class TestVersionNumber(TestCase):
 class CurrencyTests(TestCase):
     """Unit tests for currency / exchange rate functionality."""
 
-    def test_rates(self):
+    RATES = {
+        'AUD': 1.5,
+        'CAD': 1.35,
+        'CNY': 7.2,
+        'EUR': 0.9,
+        'GBP': 0.8,
+        'JPY': 150.0,
+        'NZD': 1.65,
+        'USD': 1.0,
+    }
+
+    @requests_mock.Mocker()
+    def test_rates(self, requests_mocker):
         """Test exchange rate update."""
+        # Patch setting for remote url
+        response_rates = {code: self.RATES.get(code, 1.0) for code in currency_codes()}
+        requests_mocker.get(
+            'https://api.frankfurter.app/latest', json={'rates': response_rates}
+        )
+
         # Initially, there will not be any exchange rate information
         rates = Rate.objects.all()
 
@@ -1185,24 +1217,10 @@ class CurrencyTests(TestCase):
         with self.assertRaises(MissingRate):
             convert_money(Money(100, 'AUD'), 'USD')
 
-        update_successful = False
+        InvenTree.tasks.update_exchange_rates()
 
-        # Note: the update sometimes fails in CI, let's give it a few chances
-        for idx in range(10):
-            InvenTree.tasks.update_exchange_rates()
-
-            rates = Rate.objects.all()
-
-            if rates.count() == len(currency_codes()):
-                update_successful = True
-                break
-
-            else:  # pragma: no cover
-                print('Exchange rate update failed - retrying')
-                print(f'Expected {currency_codes()}, got {[a.currency for a in rates]}')
-                time.sleep(1 + idx)
-
-        self.assertTrue(update_successful)
+        rates = Rate.objects.all()
+        self.assertEqual(rates.count(), len(currency_codes()))
 
         # Now that we have some exchange rate information, we can perform conversions
 
@@ -1298,15 +1316,52 @@ class TestSettings(InvenTreeTestCase):
 
     def test_initial_install(self):
         """Test if install of plugins on startup works."""
-        from common.settings import set_global_setting
+        from common.settings import get_global_setting, set_global_setting
         from plugin import registry
 
         set_global_setting('PLUGIN_ON_STARTUP', True)
 
         registry.reload_plugins(full_reload=True, collect=True)
-        self.assertGreater(len(settings.PLUGIN_FILE_HASH), 0)
+        self.assertGreater(
+            len(get_global_setting('_PLUGIN_FILE_HASH', '', create=False)), 0
+        )
 
         set_global_setting('PLUGIN_ON_STARTUP', False)
+
+    def test_social_backends(self):
+        """Test that social backends are normalized and de-duplicated."""
+        prefix = 'allauth.socialaccount.providers.'
+        defaults = ['saml', 'openid_connect']
+
+        # Full module path for a default backend must not produce a duplicate
+        self.assertEqual(
+            config.get_social_backends(defaults, [f'{prefix}openid_connect']),
+            [f'{prefix}openid_connect', f'{prefix}saml'],
+        )
+
+        # Mixed short and full names, with duplicates, are sorted alphabetically
+        self.assertEqual(
+            config.get_social_backends(
+                defaults, ['github', f'{prefix}github', 'saml', f'{prefix}google']
+            ),
+            [
+                f'{prefix}github',
+                f'{prefix}google',
+                f'{prefix}openid_connect',
+                f'{prefix}saml',
+            ],
+        )
+
+        # No extra backends
+        self.assertEqual(
+            config.get_social_backends(defaults, []),
+            [f'{prefix}openid_connect', f'{prefix}saml'],
+        )
+
+        # The running configuration must not contain duplicate apps
+        self.assertEqual(
+            len(settings.INSTALLED_APPS), len(set(settings.INSTALLED_APPS))
+        )
 
     def test_helpers_cfg_file(self):
         """Test get_config_file."""
@@ -1661,6 +1716,28 @@ class BarcodeMixinTest(InvenTreeTestCase):
 class SanitizerTest(TestCase):
     """Simple tests for sanitizer functions."""
 
+    def test_sanitize_token(self):
+        """Test that sanitize_token never exposes a full (or near-full) value."""
+        sanitize = InvenTree.helpers.sanitize_token
+
+        # Long values keep the front and back sections
+        value = 'inv-2-' + 'a' * 20 + '.' + 'b' * 40 + '-20261101'
+        result = sanitize(value)
+        self.assertEqual(len(result), len(value))
+        self.assertTrue(result.startswith(value[:8]))
+        self.assertTrue(result.endswith(value[-12:]))
+        self.assertIn('*' * (len(value) - 20), result)
+
+        # Short values are almost entirely masked
+        for value in ['', 'a', 'abcd123', 'x' * 20, 'y' * 21]:
+            result = sanitize(value)
+            self.assertEqual(len(result), len(value))
+            if value:
+                self.assertNotEqual(result, value)
+
+        self.assertEqual(sanitize('abcd123'), 'a******')
+        self.assertEqual(sanitize('0123456789abcdefghij'), '01234*' + '*' * 14)
+
     def test_svg_sanitizer(self):
         """Test that SVGs are sanitized accordingly."""
         valid_string = """<svg xmlns="http://www.w3.org/2000/svg" version="1.1" id="svg2" height="400" width="400">{0}
@@ -1673,6 +1750,27 @@ class SanitizerTest(TestCase):
 
         # Test that invalid string is cleaned
         self.assertNotEqual(dangerous_string, sanitize_svg(dangerous_string))
+
+    def test_svg_sanitizer_smil_bypass(self):
+        """Test that SMIL animation elements cannot be used to smuggle a javascript: URL.
+
+        A <set>/<animate>/<animateTransform> element can assign a `javascript:` value to
+        another element's `href`/`xlink:href` at render time via its `to`/`from`/`values`
+        attribute. These attributes are not treated as URLs by the sanitizer, so simply
+        stripping `javascript:` from `href`-like attributes is not sufficient - the
+        elements themselves must not be permitted.
+        """
+        malicious_string = """<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+        <a xlink:href="https://example.com">
+        <set attributeName="xlink:href" to="javascript:alert(document.domain)" />
+        <text x="10" y="20">Click me</text>
+        </a>
+        </svg>"""
+
+        cleaned = sanitize_svg(malicious_string)
+
+        self.assertNotIn('javascript:', cleaned)
+        self.assertNotIn('<set', cleaned)
 
 
 class MagicLoginTest(InvenTreeTestCase):
@@ -1707,6 +1805,18 @@ class MagicLoginTest(InvenTreeTestCase):
         self.assertEqual(resp.url, '/api/auth/login-redirect/')
         # And we should be logged in again
         self.assertEqual(resp.wsgi_request.user, self.user)
+
+    def test_duplicate_email(self):
+        """Test that duplicate email addresses do not raise a server error."""
+        User = get_user_model()
+        User.objects.create_user(
+            username='duplicate', email=self.user.email, password='password'
+        )
+
+        resp = self.client.post(reverse('sesame-generate'), {'email': self.user.email})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data, {'status': 'ok'})
+        self.assertEqual(len(mail.outbox), 0)
 
 
 class MaintenanceModeTest(InvenTreeTestCase):
@@ -1954,3 +2064,55 @@ class URLCompatibilityTest(InvenTreeTestCase):
             response = self.client.get(old_url)
             self.assertEqual(response.status_code, 302)
             self.assertEqual(response['Location'], new_url)
+
+
+class InvenTreeAppConfigTests(TestCase):
+    """Tests the app configuration setup stuff."""
+
+    def test_check_pre_migration(self):
+        """Test all startup checks for partially applied pre-1.0.0 migrations."""
+        apps.PRE_1_0_0_CHECK_DONE = True
+        self.config = apps.InvenTreeConfig('InvenTree', import_module('InvenTree'))
+
+        with self.subTest('already checked'):
+            with patch.object(
+                apps.InvenTree.ready, 'canAppAccessDatabase'
+            ) as can_access:
+                self.config.check_pre_1_0_0_upgrade()
+
+            can_access.assert_not_called()
+
+        apps.PRE_1_0_0_CHECK_DONE = False
+        with self.subTest('database unavailable'):
+            with patch.object(
+                apps.InvenTree.ready, 'canAppAccessDatabase', return_value=False
+            ) as can_access:
+                self.config.check_pre_1_0_0_upgrade()
+
+            can_access.assert_called_once_with(allow_plugins=True)
+
+        with self.subTest('no stuck apps'):
+            with patch.object(
+                apps.InvenTree.ready, 'canAppAccessDatabase', return_value=True
+            ):
+                self.config.check_pre_1_0_0_upgrade()
+
+            self.assertTrue(apps.PRE_1_0_0_CHECK_DONE)
+
+        apps.PRE_1_0_0_CHECK_DONE = False
+        with self.subTest('stuck apps'):
+            with (
+                patch.object(
+                    apps.InvenTree.ready, 'canAppAccessDatabase', return_value=True
+                ),
+                patch.object(
+                    MigrationRecorder,
+                    'applied_migrations',
+                    return_value={('part', '0003_auto_20190525_2226')},
+                ),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    self.config.check_pre_1_0_0_upgrade()
+
+            self.assertEqual(raised.exception.code, 1)
+            self.assertFalse(apps.PRE_1_0_0_CHECK_DONE)

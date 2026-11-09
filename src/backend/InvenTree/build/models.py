@@ -2,6 +2,7 @@
 
 import copy
 import decimal
+from contextlib import ExitStack
 from typing import Optional, TypedDict
 
 from django.contrib.auth.models import User
@@ -31,6 +32,13 @@ import part.models
 import report.mixins
 import stock.models
 import users.models
+from audit.helpers import (
+    audit_event,
+    audited_bulk_update,
+    copy_related_cache,
+    record_created,
+    write_batched,
+)
 from build.events import BuildEvents
 from build.filters import annotate_allocated_quantity, annotate_required_quantity
 from build.status_codes import BuildStatus, BuildStatusGroups
@@ -41,8 +49,17 @@ from build.validators import (
 from common.models import ProjectCode
 from common.settings import get_global_setting
 from generic.enums import StringEnum
-from generic.states import StateTransitionMixin, StatusCodeMixin
+from generic.states import (
+    DEFERRABLE,
+    Deprecations,
+    StateTransitionMixin,
+    StatusCodeMixin,
+    can_proceed,
+    deprecated,
+    inventree_transition,
+)
 from InvenTree.helpers_db import bulk_create_and_fetch
+from plugin.base.integration.AllocateMixin import apply_allocate_mixin
 from plugin.events import bulk_trigger_event, trigger_event
 from stock.events import StockEvents
 from stock.status_codes import StockHistoryCode, StockStatus
@@ -75,13 +92,14 @@ class BuildReportContext(report.mixins.BaseReportContext, TypedDict):
 
 
 class Build(
+    InvenTree.models.InvenTreeAuditMixin,
     InvenTree.models.PluginValidationMixin,
     report.mixins.InvenTreeReportMixin,
     InvenTree.models.InvenTreeParameterMixin,
     InvenTree.models.InvenTreeAttachmentMixin,
     InvenTree.models.InvenTreeBarcodeMixin,
+    InvenTree.models.InvenTreeNoteMixin,
     InvenTree.models.InvenTreeTagsMixin,
-    InvenTree.models.InvenTreeNotesMixin,
     InvenTree.models.ReferenceIndexingMixin,
     StateTransitionMixin,
     StatusCodeMixin,
@@ -659,6 +677,7 @@ class Build(
         quantities: Optional[dict] = None,
         notes: Optional[str] = None,
         user: Optional[User] = None,
+        expected_quantities: Optional[dict] = None,
     ):
         """Complete the allocation of stock for the given build lines.
 
@@ -667,10 +686,16 @@ class Build(
             quantities: Optional dict of quantities to allocate
             notes: Optional notes for the allocation
             user: The user completing the allocation
+            expected_quantities: Optional dict of {BuildItem pk: quantity}, a snapshot of
+                the allocated quantity of each build item at the time the request was made.
+                If provided, only build items in this dict whose current quantity still matches
+                the snapshot are processed - any other build item is skipped. This makes the
+                operation idempotent: a repeated (e.g. redelivered) request observes the
+                already-reduced quantities and does nothing.
 
         Notes:
             This unrolls what would otherwise be a per-BuildItem call, so that the underlying StockItem,
-            StockItemTracking, BuildLine and BuildItem writes can be batched into
+            audit log, BuildLine and BuildItem writes can be batched into
             a handful of bulk queries instead of several per build item.
         """
         import part.tasks
@@ -687,9 +712,40 @@ class Build(
         # Preselect related fields to avoid per-row database queries below
         build_items = list(
             build_items.select_related(
-                'build_line', 'stock_item', 'stock_item__part', 'install_into'
+                'build_line',
+                'stock_item',
+                'stock_item__part',
+                'stock_item__location',
+                'stock_item__purchase_order__supplier',
+                'install_into',
+                'install_into__part',
+                'install_into__location',
+                'install_into__purchase_order__supplier',
             )
         )
+
+        if expected_quantities is not None:
+            # Discard any build item which has changed since the request was made.
+            # This check is performed under the build row lock (above), so the
+            # build item quantities read here are current
+            expected = {
+                int(pk): decimal.Decimal(str(qty))
+                for pk, qty in expected_quantities.items()
+            }
+
+            stale = [
+                item.pk
+                for item in build_items
+                if expected.get(item.pk) != item.quantity
+            ]
+
+            if stale:
+                logger.warning(
+                    'Skipping consumption of BuildItems for BuildOrder <%s> - allocated quantity changed since request: %s',
+                    self.pk,
+                    stale,
+                )
+                build_items = [item for item in build_items if item.pk not in stale]
 
         # Lock the distinct StockItem rows (in pk order, to avoid deadlocks) and
         # re-read their quantities, so the clamping arithmetic below operates on
@@ -803,8 +859,10 @@ class Build(
         # which the tracking entries and (for installed items) BuildItem records need below
         new_stock_item_data = [new_item for _, new_item, _ in split_items]
 
-        new_stock_items = bulk_create_and_fetch(
-            stock.models.StockItem, new_stock_item_data
+        # Evaluate the queryset immediately (into a list) - otherwise, indexing into it
+        # below would re-query the database once per split item
+        new_stock_items = list(
+            bulk_create_and_fetch(stock.models.StockItem, new_stock_item_data)
         )
 
         # Back-populate the resolved primary keys onto the original 'new_item' objects
@@ -813,68 +871,23 @@ class Build(
         # resolved pk too. On backends that can't return pks from bulk_create (MySQL),
         # 'new_stock_items' are freshly-fetched, distinct objects, so a plain list
         # replacement here would leave those other references with pk=None.
-        for i, (_stock_item, new_item, _quantity) in enumerate(split_items):
+        for i, (source_item, new_item, _quantity) in enumerate(split_items):
             new_item.pk = new_stock_items[i].pk
+            new_item._state.adding = False
 
-        tracking_entries = []
+            # Retain the cached related objects (avoid per-item lookups)
+            copy_related_cache(source_item, new_item)
+            copy_related_cache(source_item, new_stock_items[i])
+
         split_events = []
         install_events = []
 
         # Split stock items for "split_items"
-        for source_item, new_item, quantity in split_items:
-            tracking_entries.append(
-                stock.models.StockItemTracking(
-                    item_id=new_item.pk,
-                    part_id=new_item.part_id,
-                    tracking_type=StockHistoryCode.SPLIT_FROM_PARENT.value,
-                    user=user,
-                    notes=notes,
-                    deltas={'stockitem': source_item.pk, 'quantity': float(quantity)},
-                )
-            )
-            tracking_entries.append(
-                stock.models.StockItemTracking(
-                    item_id=source_item.pk,
-                    part_id=source_item.part_id,
-                    tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value,
-                    user=user,
-                    notes=notes,
-                    deltas={
-                        'removed': float(quantity),
-                        'quantity': float(source_item.quantity),
-                    },
-                )
-            )
-
+        for source_item, new_item, _quantity in split_items:
             split_events.append(((), {'id': new_item.pk, 'parent': source_item.pk}))
 
         # Install stock items for "install_items"
-        for build_item, target_item, output, quantity in install_items:
-            tracking_entries.append(
-                stock.models.StockItemTracking(
-                    item_id=target_item.pk,
-                    part_id=target_item.part_id,
-                    tracking_type=StockHistoryCode.INSTALLED_INTO_ASSEMBLY.value,
-                    user=user,
-                    notes=notes,
-                    deltas={
-                        'stockitem': output.pk,
-                        'quantity': float(quantity),
-                        'buildorder': self.pk,
-                    },
-                )
-            )
-            tracking_entries.append(
-                stock.models.StockItemTracking(
-                    item_id=output.pk,
-                    part_id=output.part_id,
-                    tracking_type=StockHistoryCode.INSTALLED_CHILD_ITEM.value,
-                    user=user,
-                    notes=notes,
-                    deltas={'stockitem': target_item.pk, 'quantity': float(quantity)},
-                )
-            )
-
+        for build_item, target_item, output, _quantity in install_items:
             install_events.append((
                 (),
                 {'id': target_item.pk, 'assembly_id': output.pk},
@@ -883,26 +896,54 @@ class Build(
             # Ensure the build item points to the (possibly newly split) stock item
             build_item.stock_item = target_item
 
-        # Consume stock items for "consume_items"
-        for target_item, quantity in consume_items:
-            tracking_entries.append(
-                stock.models.StockItemTracking(
-                    item_id=target_item.pk,
-                    part_id=target_item.part_id,
-                    tracking_type=StockHistoryCode.BUILD_CONSUMED.value,
-                    user=user,
-                    notes=notes,
-                    deltas={'buildorder': self.pk, 'quantity': float(quantity)},
+        # Record the operation in the audit log - a single entry for each stock item
+        with write_batched(), ExitStack() as events:
+
+            def audit(item, code, deltas):
+                """Record a named event against the provided stock item."""
+                events.enter_context(
+                    audit_event(item, code, notes=notes, deltas=deltas, actor=user)
                 )
+
+            for source_item, new_item, quantity in split_items:
+                audit(
+                    source_item,
+                    StockHistoryCode.SPLIT_CHILD_ITEM,
+                    {
+                        'stockitem': new_item,
+                        'removed': quantity,
+                        'quantity': source_item.quantity,
+                    },
+                )
+
+            for _build_item, target_item, output, quantity in install_items:
+                audit(
+                    target_item,
+                    StockHistoryCode.INSTALLED_INTO_ASSEMBLY,
+                    {'stockitem': output, 'quantity': quantity, 'buildorder': self},
+                )
+                audit(
+                    output,
+                    StockHistoryCode.INSTALLED_CHILD_ITEM,
+                    {'stockitem': target_item, 'quantity': quantity},
+                )
+
+            for target_item, quantity in consume_items:
+                audit(
+                    target_item,
+                    StockHistoryCode.BUILD_CONSUMED,
+                    {'buildorder': self, 'quantity': quantity},
+                )
+
+            # Newly split items are recorded as created (with the consume / install event)
+            record_created(stock.models.StockItem, new_stock_items)
+
+            # Flush all StockItem field changes (quantity reductions, consumption, installs)
+            audited_bulk_update(
+                stock.models.StockItem,
+                list(seen_stock_items.values()),
+                ['quantity', 'consumed_by', 'location', 'belongs_to'],
             )
-
-        # Flush all StockItem field changes (quantity reductions, consumption, installs)
-        stock.models.StockItem.objects.bulk_update(
-            seen_stock_items.values(),
-            ['quantity', 'consumed_by', 'location', 'belongs_to'],
-        )
-
-        stock.models.StockItemTracking.objects.bulk_create(tracking_entries)
 
         # Update build lines for "seen_build_lines"
         BuildLine.objects.bulk_update(seen_build_lines.values(), ['consumed'])
@@ -959,41 +1000,28 @@ class Build(
         # which point to this Build Order
         self.allocated_stock.all().delete()
 
-    @transaction.atomic
+    # region fsm
+    @inventree_transition(
+        field=status,
+        source=[BuildStatus.PENDING, BuildStatus.PRODUCTION, BuildStatus.ON_HOLD],
+        target=DEFERRABLE(status, BuildStatus.COMPLETE),
+    )
     def complete_build(self, user: User, trim_allocated_stock: bool = False):
-        """Mark this build as complete.
+        """Transition this Build to COMPLETE status.
 
         Arguments:
             user: The user who is completing the build
             trim_allocated_stock: If True, trim any allocated stock
-        """
-        return self.handle_transition(
-            self.status,
-            BuildStatus.COMPLETE.value,
-            self,
-            self._action_complete,
-            user=user,
-            trim_allocated_stock=trim_allocated_stock,
-        )
 
-    def _action_complete(self, *args, **kwargs):
-        """Action to be taken when a build is completed."""
+        Notes:
+            The actual completion work (consuming allocations, deleting BuildItem
+            records, etc.) is done by build.tasks.complete_build(), which may run
+            inline or genuinely asynchronously on a background worker - see
+            DEFERRABLE for why the target is resolved from offload_task()'s return
+            value rather than being fixed.
+        """
         import build.tasks
 
-        # Lock this build against concurrent transitions, and re-read the status
-        # from the database. Without this, two simultaneous completion requests
-        # could both offload the completion task (duplicate events and
-        # notifications; the stock-consuming side effects are themselves
-        # guarded against double-processing
-        self.status = Build.objects.select_for_update().get(pk=self.pk).status
-
-        if self.status == BuildStatus.COMPLETE.value:
-            return
-
-        trim_allocated_stock = kwargs.pop('trim_allocated_stock', False)
-        user = kwargs.pop('user', None)
-
-        # Prevent completion if there are open child builds
         if (
             get_global_setting('BUILDORDER_REQUIRE_CLOSED_CHILDS')
             and self.has_open_child_builds
@@ -1007,8 +1035,9 @@ class Build(
                 _('Cannot complete build order with incomplete outputs')
             )
 
-        # Offload background task to complete build allocations
-        InvenTree.tasks.offload_task(
+        # Offload background task to complete build allocations. DEFERRABLE
+        # inspects this return value directly, so it must be returned as-is.
+        return InvenTree.tasks.offload_task(
             build.tasks.complete_build,
             self.pk,
             user.pk if user else None,
@@ -1016,107 +1045,73 @@ class Build(
             group='build',
         )
 
-    @transaction.atomic
+    @inventree_transition(
+        field=status,
+        source=[BuildStatus.PENDING, BuildStatus.ON_HOLD],
+        target=BuildStatus.PRODUCTION,
+        event=BuildEvents.ISSUED,
+    )
     def issue_build(self):
-        """Mark the Build as IN PRODUCTION.
+        """Transition this Build to PRODUCTION status.
 
-        Args:
-            user: The user who is issuing the build
+        The build must currently be PENDING or ON_HOLD.
         """
-        return self.handle_transition(
-            self.status, BuildStatus.PENDING.value, self, self._action_issue
+        from build.tasks import check_build_stock
+
+        # Run checks on required parts
+        InvenTree.tasks.offload_task(
+            check_build_stock, self, group='build', force_async=True
         )
 
     @property
+    @deprecated(Deprecations.CAN_PROCEED, version='1.5.0')
     def can_issue(self) -> bool:
         """Returns True if this BuildOrder can be issued."""
-        return self.status in [BuildStatus.PENDING.value, BuildStatus.ON_HOLD.value]
+        return can_proceed(self.issue_build)
 
-    def _action_issue(self, *args, **kwargs):
-        """Perform the action to mark this order as PRODUCTION."""
-        # Lock this build against concurrent transitions, and re-read the status
-        # from the database. Without this, two simultaneous requests can both
-        # observe an eligible status, and each would run the issue side effects
-        # (duplicate events and offloaded stock-check tasks).
-        self.status = Build.objects.select_for_update().get(pk=self.pk).status
-
-        if self.can_issue:
-            self.status = BuildStatus.PRODUCTION.value
-            self.save()
-
-            trigger_event(BuildEvents.ISSUED, id=self.pk)
-
-            from build.tasks import check_build_stock
-
-            # Run checks on required parts
-            InvenTree.tasks.offload_task(
-                check_build_stock, self, group='build', force_async=True
-            )
-
-    @transaction.atomic
+    @inventree_transition(
+        field=status,
+        source=[BuildStatus.PENDING, BuildStatus.PRODUCTION],
+        target=BuildStatus.ON_HOLD,
+        event=BuildEvents.HOLD,
+    )
     def hold_build(self):
-        """Mark the Build as ON HOLD."""
-        return self.handle_transition(
-            self.status, BuildStatus.ON_HOLD.value, self, self._action_hold
-        )
+        """Transition this Build to ON_HOLD status.
+
+        The build must currently be PENDING or PRODUCTION.
+        """
 
     @property
+    @deprecated(Deprecations.CAN_PROCEED, version='1.5.0')
     def can_hold(self) -> bool:
         """Returns True if this BuildOrder can be placed on hold."""
-        return self.status in [BuildStatus.PENDING.value, BuildStatus.PRODUCTION.value]
+        return can_proceed(self.hold_build)
 
-    def _action_hold(self, *args, **kwargs):
-        """Action to be taken when a build is placed on hold."""
-        # Lock this build against concurrent transitions, and re-read the status
-        # from the database. Without this, two simultaneous requests can both
-        # observe an eligible status, and each would run the hold side effects
-        # (duplicate events).
-        self.status = Build.objects.select_for_update().get(pk=self.pk).status
+    @inventree_transition(
+        field=status,
+        source=[BuildStatus.PENDING, BuildStatus.PRODUCTION, BuildStatus.ON_HOLD],
+        target=DEFERRABLE(status, BuildStatus.CANCELLED),
+    )
+    def cancel_build(self, user=None, **kwargs):
+        """Transition this Build to CANCELLED status.
 
-        if self.can_hold:
-            self.status = BuildStatus.ON_HOLD.value
-            self.save()
+        Offloads expensive cleanup operations (de-allocating stock, removing
+        incomplete outputs) to a background task.
 
-            trigger_event(BuildEvents.HOLD, id=self.pk)
-
-    @transaction.atomic
-    def cancel_build(self, user, **kwargs):
-        """Mark the Build as CANCELLED.
-
-        - Delete any pending BuildItem objects (but do not remove items from stock)
-        - Set build status to CANCELLED
-        - Save the Build object
+        Notes:
+            See DEFERRABLE - build.tasks.cancel_build() performs the actual
+            cleanup and sets completion_date/completed_by/status itself, once
+            that work is genuinely finished, in case it runs asynchronously.
         """
-        return self.handle_transition(
-            self.status,
-            BuildStatus.CANCELLED.value,
-            self,
-            self._action_cancel,
-            user=user,
-            **kwargs,
-        )
-
-    def _action_cancel(self, *args, **kwargs):
-        """Action to be taken when a build is cancelled."""
         import build.tasks
-
-        # Lock this build against concurrent transitions, and re-read the status
-        # from the database. Without this, two simultaneous cancellation requests
-        # could both offload the cancellation task (duplicate events and
-        # notifications; the stock-consuming side effects are themselves
-        # guarded against double-processing
-        self.status = Build.objects.select_for_update().get(pk=self.pk).status
-
-        if self.status == BuildStatus.CANCELLED.value:
-            return
-
-        user = kwargs.pop('user', None)
 
         remove_allocated_stock = kwargs.get('remove_allocated_stock', False)
         remove_incomplete_outputs = kwargs.get('remove_incomplete_outputs', False)
 
-        # Offload background task to take care of the expensive operations
-        InvenTree.tasks.offload_task(
+        # Offload background task to take care of the expensive operations.
+        # DEFERRABLE inspects this return value directly, so it must be
+        # returned as-is.
+        return InvenTree.tasks.offload_task(
             build.tasks.cancel_build,
             self.pk,
             user.pk if user else None,
@@ -1125,12 +1120,7 @@ class Build(
             group='build',
         )
 
-        # Date of 'completion' is the date the build was cancelled
-        self.completion_date = InvenTree.helpers.current_date()
-        self.completed_by = user
-
-        self.status = BuildStatus.CANCELLED.value
-        self.save()
+    # endregion fsm
 
     @transaction.atomic
     def deallocate_stock(self, build_line=None, output=None):
@@ -1192,12 +1182,22 @@ class Build(
         if serials:
             """Create multiple build outputs with a single quantity of 1."""
 
-            # Create tracking entries for each item
-            tracking = []
             allocations = []
 
+            # Record a tracking event for each new output
             outputs = stock.models.StockItem._create_serial_numbers(
                 serials,
+                tracking=lambda output: {
+                    'entry_type': StockHistoryCode.BUILD_OUTPUT_CREATED,
+                    'user': user,
+                    'deltas': {
+                        'quantity': 1,
+                        'buildorder': self,
+                        'batch': output.batch,
+                        'serial': output.serial,
+                        'location': location,
+                    },
+                },
                 part=self.part,
                 build=self,
                 batch=batch,
@@ -1206,21 +1206,6 @@ class Build(
             )
 
             for output in outputs:
-                # Generate a new historical tracking entry
-                if entry := output.add_tracking_entry(
-                    StockHistoryCode.BUILD_OUTPUT_CREATED,
-                    user,
-                    deltas={
-                        'quantity': 1,
-                        'buildorder': self.pk,
-                        'batch': output.batch,
-                        'serial': output.serial,
-                        'location': location.pk if location else None,
-                    },
-                    commit=False,
-                ):
-                    tracking.append(entry)
-
                 # Auto-allocate stock based on serial number
                 if auto_allocate:
                     if new_allocations := self.auto_allocate_tracked_output(
@@ -1228,16 +1213,13 @@ class Build(
                     ):
                         allocations.extend(new_allocations)
 
-            # Bulk create tracking entries
-            stock.models.StockItemTracking.objects.bulk_create(tracking, batch_size=250)
-
             # Generate stock allocations
             BuildItem.objects.bulk_create(allocations, batch_size=250)
 
         else:
             """Create a single build output of the given quantity."""
 
-            output = stock.models.StockItem.objects.create(
+            output = stock.models.StockItem(
                 quantity=quantity,
                 location=location,
                 part=self.part,
@@ -1246,16 +1228,17 @@ class Build(
                 is_building=True,
             )
 
-            output.add_tracking_entry(
+            with output.tracking_event(
                 StockHistoryCode.BUILD_OUTPUT_CREATED,
                 user,
                 deltas={
                     'quantity': float(quantity),
-                    'buildorder': self.pk,
+                    'buildorder': self,
                     'batch': batch,
-                    'location': location.pk if location else None,
+                    'location': location,
                 },
-            )
+            ):
+                output.save()
 
             # Ensure we return a QuerySet object here, too
             outputs = stock.models.StockItem.objects.filter(pk=output.pk)
@@ -1395,32 +1378,31 @@ class Build(
             )
             output.build = self
 
-        # Update build output item
-        output.is_building = False
-        output.status = StockStatus.REJECTED.value
-        output.location = location
-        output.save(add_note=False)
-
-        allocated_items = output.items_to_install.all()
-
-        # Complete or discard allocations
-        if not discard_allocations:
-            self.complete_allocations(build_items=allocated_items, user=user)
-
-        # Delete allocations
-        allocated_items.all().delete()
-
-        output.add_tracking_entry(
+        with output.tracking_event(
             StockHistoryCode.BUILD_OUTPUT_REJECTED,
             user,
             notes=notes,
             deltas={
                 'quantity': float(quantity),
-                'location': location.pk,
+                'location': location,
                 'status': StockStatus.REJECTED.value,
-                'buildorder': self.pk,
+                'buildorder': self,
             },
-        )
+        ):
+            # Update build output item
+            output.is_building = False
+            output.status = StockStatus.REJECTED.value
+            output.location = location
+            output.save(add_note=False)
+
+            allocated_items = output.items_to_install.all()
+
+            # Complete or discard allocations
+            if not discard_allocations:
+                self.complete_allocations(build_items=allocated_items, user=user)
+
+            # Delete allocations
+            allocated_items.all().delete()
 
     def can_complete_output(
         self,
@@ -1538,20 +1520,19 @@ class Build(
         # Assign the stock status
         output.set_status(status)
 
-        output.save(add_note=False)
-
         deltas = {
             'status': status,
-            'buildorder': self.pk,
+            'buildorder': self,
             'quantity': float(output.quantity),
         }
 
         if location:
-            deltas['location'] = location.pk
+            deltas['location'] = location
 
-        output.add_tracking_entry(
+        with output.tracking_event(
             StockHistoryCode.BUILD_OUTPUT_COMPLETED, user, notes=notes, deltas=deltas
-        )
+        ):
+            output.save(add_note=False)
 
         trigger_event(BuildEvents.OUTPUT_COMPLETED, id=output.pk, build_id=self.pk)
 
@@ -1773,6 +1754,11 @@ class Build(
                 )
             )
 
+            # Allow plugins to filter / reorder the candidate stock items
+            available_items = apply_allocate_mixin(
+                'filter_build_allocation', line_item, available_items, **kwargs
+            )
+
             if len(available_items) == 1:
                 allocations.append(
                     BuildItem(
@@ -1946,6 +1932,11 @@ class Build(
                 key=lambda item, b=bom_item, v=variant_parts: stock_sort(item, b, v),
             )
 
+            # Allow plugins to filter / reorder the candidate stock items
+            available_stock = apply_allocate_mixin(
+                'filter_build_allocation', line_item, available_stock, **kwargs
+            )
+
             if len(available_stock) != 1 and not interchangeable:
                 # Multiple stock items are available, but they are not interchangeable -
                 # the user must manually decide how to allocate them.
@@ -2058,7 +2049,7 @@ class Build(
             )
 
             # The amount allocated against an output must at least equal the BOM quantity
-            if allocated['q'] < line.bom_item.quantity:
+            if allocated['q'] < line.bom_item.unit_quantity:
                 return False
 
         # At this stage, we can assume that the output is fully allocated
@@ -2139,7 +2130,7 @@ class Build(
         """Rebuild required quantity field for each BuildLine object."""
         lines_to_update = []
 
-        for line in self.build_lines.all():
+        for line in self.build_lines.select_related('bom_item').all():
             line.quantity = line.bom_item.get_required_quantity(self.quantity)
             lines_to_update.append(line)
 

@@ -5,7 +5,6 @@ import {
   IconBookmark,
   IconBoxPadding,
   IconChecklist,
-  IconHistory,
   IconInfoCircle,
   IconPackages,
   IconShoppingCart,
@@ -41,6 +40,9 @@ import InstanceDetail from '../../components/nav/InstanceDetail';
 import NavigationTree from '../../components/nav/NavigationTree';
 import { PageDetail } from '../../components/nav/PageDetail';
 import AttachmentPanel from '../../components/panels/AttachmentPanel';
+import HistoryPanel, {
+  useShowHistoryPanel
+} from '../../components/panels/HistoryPanel';
 import NotesPanel from '../../components/panels/NotesPanel';
 import { PanelGroup } from '../../components/panels/PanelGroup';
 import LocateItemButton from '../../components/plugins/LocateItemButton';
@@ -60,6 +62,7 @@ import {
   useEditApiFormModal
 } from '../../hooks/UseForm';
 import { useInstance } from '../../hooks/UseInstance';
+import { useInstanceInfo } from '../../hooks/UseInstanceInfo';
 import { useStockAdjustActions } from '../../hooks/UseStockAdjustActions';
 import { useGlobalSettingsState } from '../../states/SettingsStates';
 import { useUserState } from '../../states/UserState';
@@ -68,7 +71,6 @@ import SalesOrderAllocationTable from '../../tables/sales/SalesOrderAllocationTa
 import InstalledItemsTable from '../../tables/stock/InstalledItemsTable';
 import { StockItemTable } from '../../tables/stock/StockItemTable';
 import StockItemTestResultTable from '../../tables/stock/StockItemTestResultTable';
-import { StockTrackingTable } from '../../tables/stock/StockTrackingTable';
 import TransferOrderAllocationTable from '../../tables/stock/TransferOrderAllocationTable';
 import { StockDetailsPanel } from './StockDetailsPanel';
 
@@ -112,6 +114,11 @@ export default function StockDetail() {
     defaultValue: {}
   });
 
+  const { instanceInfo } = useInstanceInfo({
+    modelType: ModelType.stockitem,
+    modelId: stockitem?.pk
+  });
+
   const showBuildAllocations: boolean = useMemo(() => {
     // Determine if "build allocations" should be shown for this stock item
     return (
@@ -128,7 +135,7 @@ export default function StockDetail() {
   const showTransferAllocations: boolean = useMemo(() => {
     return (
       !stockitem?.part_detail?.virtual &&
-      globalSettings.isSet('TRANSFERORDER_ENABLED')
+      globalSettings.isSet('TRANSFERORDER_ENABLED') // todo check if role is available
     );
   }, [stockitem]);
 
@@ -176,6 +183,8 @@ export default function StockDetail() {
     return stockitem?.part_detail?.assembly;
   }, [trackedBomItemQuery, stockitem]);
 
+  const showHistory = useShowHistoryPanel();
+
   const stockPanels: PanelType[] = useMemo(() => {
     return [
       {
@@ -189,16 +198,6 @@ export default function StockDetail() {
             showSerialNav
             refreshInstance={refreshInstance}
           />
-        )
-      },
-      {
-        name: 'tracking',
-        label: t`Stock Tracking`,
-        icon: <IconHistory />,
-        content: stockitem.pk ? (
-          <StockTrackingTable itemId={stockitem.pk} />
-        ) : (
-          <Skeleton />
         )
       },
       {
@@ -307,21 +306,29 @@ export default function StockDetail() {
       },
       AttachmentPanel({
         model_type: ModelType.stockitem,
-        model_id: stockitem.pk
+        model_id: stockitem.pk,
+        attachment_count: instanceInfo.attachment_count
       }),
       NotesPanel({
         model_type: ModelType.stockitem,
         model_id: stockitem.pk,
-        has_note: !!stockitem.notes
+        note_count: instanceInfo.note_count
+      }),
+      HistoryPanel({
+        model_type: ModelType.stockitem,
+        model_id: stockitem.pk,
+        visible: showHistory
       })
     ];
   }, [
+    showHistory,
     showSalesAllocations,
     showBuildAllocations,
     showInstalledItems,
     stockitem,
     id,
-    user
+    user,
+    instanceInfo
   ]);
 
   const breadcrumbs = useMemo(
@@ -348,7 +355,6 @@ export default function StockDetail() {
     title: t`Edit Stock Item`,
     modalId: 'edit-stock-item',
     fields: editStockItemFields,
-    queryParams: new URLSearchParams({ tags: 'true' }),
     onFormSuccess: refreshInstance
   });
 
@@ -374,7 +380,9 @@ export default function StockDetail() {
 
   const duplicateStockItemFields = useStockFields({
     create: true,
-    modalId: 'duplicate-stock-item'
+    modalId: 'duplicate-stock-item',
+    duplicateStockItem: stockitem,
+    locationId: stockitem.location
   });
 
   const duplicateStockData = useMemo(() => {
@@ -650,23 +658,27 @@ export default function StockDetail() {
           <DetailsBadge
             color='yellow'
             label={t`In Production`}
+            tooltip={t`This stock item is currently being built`}
             visible={stockitem.is_building}
           />,
           <DetailsBadge
             color='blue'
             label={`${t`Serial Number`}: ${stockitem.serial}`}
+            tooltip={t`Serial number of this stock item`}
             visible={!!stockitem.serial}
             key='serial'
           />,
           <DetailsBadge
             color='blue'
             label={`${t`Quantity`}: ${formatDecimal(stockitem.quantity)}`}
+            tooltip={t`Total quantity of this stock item`}
             visible={!stockitem.serial}
             key='quantity'
           />,
           <DetailsBadge
             color='yellow'
             label={`${t`Available`}: ${formatDecimal(available)}`}
+            tooltip={t`Quantity which is not allocated to orders`}
             visible={
               stockitem.in_stock &&
               !stockitem.serial &&
@@ -677,6 +689,7 @@ export default function StockDetail() {
           <DetailsBadge
             color='blue'
             label={`${t`Batch Code`}: ${stockitem.batch}`}
+            tooltip={t`Batch code of this stock item`}
             visible={!!stockitem.batch}
             key='batch'
           />,
@@ -692,18 +705,21 @@ export default function StockDetail() {
           <DetailsBadge
             color='yellow'
             label={t`Stale`}
+            tooltip={t`This stock item is approaching its expiry date`}
             visible={enableExpiry && stockitem.stale && !stockitem.expired}
             key='stale'
           />,
           <DetailsBadge
             color='orange'
             label={t`Expired`}
+            tooltip={t`This stock item has passed its expiry date`}
             visible={enableExpiry && stockitem.expired}
             key='expired'
           />,
           <DetailsBadge
             color='red'
             label={t`Unavailable`}
+            tooltip={t`This stock item is not available in stock`}
             visible={stockitem.in_stock == false}
             key='unavailable'
           />
@@ -718,47 +734,51 @@ export default function StockDetail() {
         requiredPermission={ModelType.stockitem}
       >
         <Stack>
-          {user.hasViewRole(UserRoles.stock_location) && (
-            <NavigationTree
-              title={t`Stock Locations`}
-              modelType={ModelType.stocklocation}
-              endpoint={ApiEndpoints.stock_location_tree}
-              childIdentifier='sublocations'
-              opened={treeOpen}
-              onClose={() => setTreeOpen(false)}
-              selectedId={stockitem?.location}
-            />
-          )}
-          <PageDetail
-            title={t`Stock Item`}
-            subtitle={stockitem.part_detail?.full_name}
-            imageUrl={stockitem.part_detail?.thumbnail}
-            editAction={editStockItem.open}
-            editEnabled={user.hasChangePermission(ModelType.stockitem)}
-            badges={stockBadges}
-            breadcrumbs={
-              user.hasViewRole(UserRoles.stock_location)
-                ? breadcrumbs
-                : undefined
-            }
-            lastCrumb={[
-              {
-                name: stockitem.name,
-                url: `/stock/item/${stockitem.pk}/`
-              }
-            ]}
-            breadcrumbAction={() => {
-              setTreeOpen(true);
-            }}
-            actions={stockActions}
-          />
-          <PanelGroup
-            pageKey='stockitem'
-            panels={stockPanels}
-            model={ModelType.stockitem}
-            id={stockitem.pk}
-            instance={stockitem}
-          />
+          <NavigationTree
+            hidden={!user.hasViewRole(UserRoles.stock_location)}
+            title={t`Stock Locations`}
+            modelType={ModelType.stocklocation}
+            endpoint={ApiEndpoints.stock_location_tree}
+            childIdentifier='sublocations'
+            opened={treeOpen}
+            onClose={() => setTreeOpen(false)}
+            selectedId={stockitem?.location}
+          >
+            <Stack>
+              <PageDetail
+                model={ModelType.stockitem}
+                id={stockitem.pk}
+                title={t`Stock Item`}
+                subtitle={stockitem.part_detail?.full_name}
+                imageUrl={stockitem.part_detail?.thumbnail}
+                editAction={editStockItem.open}
+                editEnabled={user.hasChangePermission(ModelType.stockitem)}
+                badges={stockBadges}
+                breadcrumbs={
+                  user.hasViewRole(UserRoles.stock_location)
+                    ? breadcrumbs
+                    : undefined
+                }
+                lastCrumb={[
+                  {
+                    name: stockitem.name,
+                    url: `/stock/item/${stockitem.pk}/`
+                  }
+                ]}
+                breadcrumbAction={() => {
+                  setTreeOpen(true);
+                }}
+                actions={stockActions}
+              />
+              <PanelGroup
+                pageKey='stockitem'
+                panels={stockPanels}
+                model={ModelType.stockitem}
+                id={stockitem.pk}
+                instance={stockitem}
+              />
+            </Stack>
+          </NavigationTree>
         </Stack>
       </InstanceDetail>
       {editStockItem.modal}

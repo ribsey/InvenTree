@@ -5,6 +5,7 @@ from typing import Optional
 
 from django.core.exceptions import ValidationError
 from django.db.models import Model
+from django.dispatch import receiver
 from django.utils.translation import gettext_lazy as _
 
 import structlog
@@ -15,6 +16,7 @@ import common.notifications
 import InvenTree.helpers
 import InvenTree.helpers_model
 from common.settings import get_global_setting
+from common.signals import post_currency_change
 from InvenTree.tasks import (
     ScheduledTask,
     batch_offload_tasks,
@@ -257,7 +259,8 @@ def check_missing_pricing(limit=250):
     Arguments:
         limit: Maximum number of parts to process at once
     """
-    from part.models import Part, PartPricing
+    from part.models import Part
+    from pricing.models import PartPricing
 
     # Find any parts which have 'old' pricing information
     days = int(get_global_setting('PRICING_UPDATE_DAYS', 30))
@@ -311,6 +314,12 @@ def check_missing_pricing(limit=250):
                 pricing = p.pricing
                 pricing.save()
                 pricing.schedule_for_update()
+
+
+@receiver(post_currency_change, dispatch_uid='dispatch_check_missing_pricing')
+def dispatch_check_missing_pricing(*args, **kwargs):
+    """Trigger pricing update."""
+    offload_task(check_missing_pricing, force_async=True, group='pricing')
 
 
 @tracer.start_as_current_span('scheduled_stocktake_reports')

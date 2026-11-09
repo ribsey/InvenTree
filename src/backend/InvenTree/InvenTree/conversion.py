@@ -18,6 +18,12 @@ _UNIT_REG_CACHE_KEY = 'unit_registry_hash'
 _unit_registry = None
 _unit_registry_hash: str = ''
 
+# Registry of built-in units only (never modified after construction)
+_base_unit_registry = None
+
+# Relative tolerance used when comparing converted (floating point) numeric values
+NUMERIC_RELATIVE_TOLERANCE = 1e-9
+
 logger = structlog.get_logger('inventree')
 
 # Disable log output for Pint library
@@ -94,19 +100,8 @@ def get_unit_registry():
     return _unit_registry
 
 
-def reload_unit_registry():
-    """Reload the unit registry from the database.
-
-    This function is called at startup, and whenever the database is updated.
-    """
-    import time
-
-    t_start = time.time()
-
-    global _unit_registry
-
-    _unit_registry = None
-
+def new_base_registry() -> pint.UnitRegistry:
+    """Construct a new pint UnitRegistry, with InvenTree's default (non-custom) unit definitions."""
     reg = pint.UnitRegistry(autoconvert_offset_to_baseunit=True)
 
     # Aliases for temperature units
@@ -123,6 +118,45 @@ def reload_unit_registry():
     reg.define('dozen = 12 = dz')
     reg.define('hundred = 100')
     reg.define('thousand = 1000')
+
+    return reg
+
+
+def is_base_unit_name(name: str) -> bool:
+    """Return True if the provided name resolves to a built-in (non-custom) unit.
+
+    This includes prefixed and plural forms (e.g. 'kpound', 'meters'),
+    as pint would resolve these to the existing unit definition.
+    """
+    global _base_unit_registry
+
+    if not name:
+        return False
+
+    if _base_unit_registry is None:
+        _base_unit_registry = new_base_registry()
+
+    # Note: 'name in registry' cannot be used here, as it evaluates expressions (e.g. 'm/A')
+    try:
+        return len(_base_unit_registry.parse_unit_name(name)) > 0
+    except Exception:
+        return False
+
+
+def reload_unit_registry():
+    """Reload the unit registry from the database.
+
+    This function is called at startup, and whenever the database is updated.
+    """
+    import time
+
+    t_start = time.time()
+
+    global _unit_registry
+
+    _unit_registry = None
+
+    reg = new_base_registry()
 
     # Allow for custom units to be defined in the database
     # Calculate a hash of all custom units
@@ -154,6 +188,41 @@ def reload_unit_registry():
 
     dt = time.time() - t_start
     logger.debug('Loaded unit registry in %.3f s', dt)
+
+    return reg
+
+
+def build_candidate_unit_registry(
+    pending_fmt_string: str, exclude_pk: Optional[int] = None
+) -> pint.UnitRegistry:
+    """Build a throwaway unit registry, to validate a pending (not yet saved) custom unit definition.
+
+    This constructs the registry that *would* result from saving the pending custom unit,
+    without touching the shared, cached unit registry. This allows us to detect issues
+    (such as a circular reference between two custom units) which only appear once every
+    custom unit definition is loaded together.
+
+    Arguments:
+        pending_fmt_string: The pint format string for the (not yet saved) custom unit
+        exclude_pk: If provided, exclude the CustomUnit with this primary key from the
+            existing database records (used when validating an update to an existing unit)
+
+    Returns:
+        A new pint.UnitRegistry instance, with all custom units (including the pending one) loaded
+    """
+    from common.models import CustomUnit
+
+    reg = new_base_registry()
+
+    custom_units = CustomUnit.objects.all()
+
+    if exclude_pk is not None:
+        custom_units = custom_units.exclude(pk=exclude_pk)
+
+    for cu in custom_units:
+        reg.define(cu.fmt_string())
+
+    reg.define(pending_fmt_string)
 
     return reg
 
@@ -329,3 +398,19 @@ def is_dimensionless(value):
         return True
 
     return value.to_base_units().units == ureg.dimensionless
+
+
+def numeric_tolerance(value: float) -> float:
+    """Return the tolerance to use when comparing the provided numeric value.
+
+    Unit conversion (e.g. '100nF' vs '0.1uF') can produce floating point values which
+    differ in the last few bits, so an exact equality comparison is not reliable.
+    The tolerance scales with the magnitude of the value (a zero value is compared exactly).
+    """
+    return abs(value) * NUMERIC_RELATIVE_TOLERANCE
+
+
+def numeric_range(value: float) -> tuple[float, float]:
+    """Return the (min, max) range within which a numeric value is considered equal."""
+    epsilon = numeric_tolerance(value)
+    return (value - epsilon, value + epsilon)

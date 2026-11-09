@@ -1,13 +1,20 @@
 """API tests for various user / auth API endpoints."""
 
 import datetime
+import time
 from unittest import mock
 
 from django.contrib.auth.models import Group, User
 from django.urls import reverse
 
+from allauth.account.internal.flows.login import AUTHENTICATION_METHODS_SESSION_KEY
+from allauth.account.models import EmailAddress
+from allauth.mfa.models import Authenticator
+
+import InvenTree.helpers
+from common.models import NotificationMessage
 from InvenTree.unit_test import InvenTreeAPITestCase
-from users.models import ApiToken
+from users.models import ApiToken, default_token
 from users.ruleset import RULESET_NAMES, get_ruleset_models
 
 
@@ -123,12 +130,30 @@ class UserAPITests(InvenTreeAPITestCase):
         self.assertEqual(response.data['is_staff'], False)
         self.assertEqual(response.data['is_superuser'], False)
         self.assertEqual(response.data['is_active'], True)
+        self.assertTrue(
+            EmailAddress.objects.filter(
+                user__username=data['username'], email=data['email'], primary=True
+            ).exists()
+        )
+
+        # A second user with the same email address (any case) is rejected
+        response = self.post(
+            url,
+            data={**data, 'username': 'test2', 'email': 'AA@example.org'},
+            expected_code=400,
+        )
+        self.assertIn('email', response.data)
 
         # Try to adjust the 'is_superuser' field
         # Only a "superuser" can set this field
         response = self.post(
             url,
-            data={**data, 'username': 'Superuser', 'is_superuser': True},
+            data={
+                **data,
+                'username': 'Superuser',
+                'email': 'su@example.org',
+                'is_superuser': True,
+            },
             expected_code=403,
         )
 
@@ -140,12 +165,59 @@ class UserAPITests(InvenTreeAPITestCase):
 
         response = self.post(
             url,
-            data={**data, 'username': 'Superuser', 'is_superuser': True},
+            data={
+                **data,
+                'username': 'Superuser',
+                'email': 'su@example.org',
+                'is_superuser': True,
+            },
             expected_code=201,
         )
 
         self.assertEqual(response.data['username'], 'Superuser')
         self.assertEqual(response.data['is_superuser'], True)
+
+    def test_user_create_with_groups(self):
+        """Test that groups can be assigned when creating a new user via the API."""
+        url = reverse('api-user-list')
+
+        group_a = Group.objects.create(name='Group A')
+        group_b = Group.objects.create(name='Group B')
+
+        self.user.is_staff = True
+        self.user.save()
+        self.assignRole('admin.add')
+
+        data = {
+            'username': 'grouped',
+            'first_name': 'Grouped',
+            'last_name': 'User',
+            'email': 'grouped@example.org',
+            'group_ids': [group_a.pk, group_b.pk],
+        }
+
+        response = self.post(url, data=data, expected_code=201)
+
+        self.assertEqual(response.data['username'], 'grouped')
+
+        group_names = {g['name'] for g in response.data['groups']}
+        self.assertEqual(group_names, {'Group A', 'Group B'})
+
+        user = User.objects.get(username='grouped')
+        self.assertEqual(set(user.groups.all()), {group_a, group_b})
+
+        # Creating a user without specifying groups must still work
+        response = self.post(
+            url,
+            data={
+                **data,
+                'username': 'ungrouped',
+                'email': 'ungrouped@example.org',
+                'group_ids': [],
+            },
+            expected_code=201,
+        )
+        self.assertEqual(response.data['groups'], [])
 
     def test_user_detail(self):
         """Test the UserDetail API endpoint."""
@@ -307,10 +379,16 @@ class UserAPITests(InvenTreeAPITestCase):
         ]:
             self.assertIn(field, response.data)
 
-        # Change their own username
-        for name in ['Henry', 'Sally']:
-            response = self.patch(url, data={'username': name}, expected_code=200)
-            self.assertEqual(response.data['username'], name)
+        # Username and email are read-only
+        for name in ['username', 'email']:
+            self.assertTrue(fields[name]['read_only'])
+
+        # Users can change their own name
+        response = self.patch(
+            url, data={'first_name': 'Henry', 'last_name': 'Sally'}, expected_code=200
+        )
+        self.assertEqual(response.data['first_name'], 'Henry')
+        self.assertEqual(response.data['last_name'], 'Sally')
 
         # Defined starting point for the user
         for v in [True, False]:
@@ -334,6 +412,153 @@ class UserAPITests(InvenTreeAPITestCase):
 
         # User cannot fetch their own details if they are not active
         response = self.get(url, expected_code=401)
+
+    def test_me_endpoint_identity_fields_read_only(self):
+        """A user must not be able to change their own username or email via '/api/user/me/'.
+
+        - Setting another user's email breaks email-based flows (login link) for that user
+        - Changing email bypasses allauth email verification
+        - Claiming an unused username hijacks a future LDAP / remote-user login
+        """
+        url = reverse('api-user-me')
+
+        victim = User.objects.create_user(
+            username='victim', email='victim@example.com', password='password'
+        )
+
+        original_username = self.user.username
+        original_email = self.user.email
+
+        for data in [
+            {'email': victim.email},
+            {'email': 'unverified@example.com'},
+            {'username': 'not_yet_logged_in'},
+            {'username': 'not_yet_logged_in', 'email': 'other@example.com'},
+        ]:
+            # Read-only fields are silently ignored
+            response = self.patch(url, data=data, expected_code=200)
+            self.assertEqual(response.data['username'], original_username)
+            self.assertEqual(response.data['email'], original_email)
+
+            self.user.refresh_from_db()
+            self.assertEqual(self.user.username, original_username)
+            self.assertEqual(self.user.email, original_email)
+
+        # The victim's email must still be unique
+        self.assertEqual(User.objects.filter(email__iexact=victim.email).count(), 1)
+        self.assertFalse(User.objects.filter(username='not_yet_logged_in').exists())
+
+        # Full update (PUT) must not change the fields either
+        response = self.put(
+            url,
+            data={
+                'username': 'not_yet_logged_in',
+                'email': victim.email,
+                'first_name': 'A',
+                'last_name': 'B',
+            },
+            expected_code=200,
+        )
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.username, original_username)
+        self.assertEqual(self.user.email, original_email)
+        self.assertEqual(self.user.first_name, 'A')
+
+    def test_admin_can_edit_user_identity(self):
+        """A staff user with the 'admin' role can still change another user's username and email."""
+        other = User.objects.create_user(
+            username='other', email='other@example.com', password='password'
+        )
+        url = reverse('api-user-detail', kwargs={'pk': other.pk})
+
+        # Without staff + admin role, no write access
+        self.patch(url, data={'username': 'renamed'}, expected_code=403)
+
+        self.assignRole('admin.change')
+        self.user.is_staff = True
+        self.user.save()
+
+        response = self.patch(
+            url,
+            data={'username': 'renamed', 'email': 'renamed@example.com'},
+            expected_code=200,
+        )
+        self.assertEqual(response.data['username'], 'renamed')
+        self.assertEqual(response.data['email'], 'renamed@example.com')
+
+        other.refresh_from_db()
+        self.assertEqual(other.username, 'renamed')
+        self.assertEqual(other.email, 'renamed@example.com')
+
+    def test_admin_cannot_set_duplicate_email(self):
+        """An admin cannot assign an email address which is already in use by another user.
+
+        Email-based flows (password reset, login link) fail silently for
+        a user whose email address is shared with another account.
+        """
+        self.assignRole('admin.change')
+        self.assignRole('admin.add')
+        self.user.is_staff = True
+        self.user.save()
+
+        first = User.objects.create_user(
+            username='first', email='first@example.com', password='password'
+        )
+        second = User.objects.create_user(
+            username='second', email='second@example.com', password='password'
+        )
+
+        # An address known only to allauth (e.g. a secondary address) is also taken
+        EmailAddress.objects.create(
+            user=first, email='first.alt@example.com', verified=True
+        )
+
+        url = reverse('api-user-detail', kwargs={'pk': second.pk})
+
+        for email in [
+            'first@example.com',
+            'FIRST@Example.com',  # Case-insensitive match
+            'first.alt@example.com',
+        ]:
+            response = self.patch(url, data={'email': email}, expected_code=400)
+            self.assertIn(
+                'A user with this email address already exists',
+                str(response.data['email']),
+            )
+
+        second.refresh_from_db()
+        self.assertEqual(second.email, 'second@example.com')
+
+        # Re-submitting the user's own address (e.g. a full PUT from the edit form) is fine
+        response = self.patch(
+            url,
+            data={'email': 'SECOND@example.com', 'first_name': 'Sec'},
+            expected_code=200,
+        )
+        self.assertEqual(response.data['first_name'], 'Sec')
+
+        # As is a new, unused address, or a blank one
+        for email in ['new@example.com', '']:
+            response = self.patch(url, data={'email': email}, expected_code=200)
+            self.assertEqual(response.data['email'], email)
+
+        # User creation also rejects duplicates
+        response = self.post(
+            reverse('api-user-list'),
+            data={'username': 'third', 'email': 'First@example.com'},
+            expected_code=400,
+        )
+        self.assertIn('email', response.data)
+        self.assertFalse(User.objects.filter(username='third').exists())
+
+    def test_me_endpoint_delete_is_blocked(self):
+        """A user must not be able to delete their own account via '/api/user/me/'."""
+        url = reverse('api-user-me')
+        pk = self.user.pk
+
+        self.delete(url, expected_code=405)
+
+        self.assertTrue(User.objects.filter(pk=pk).exists())
 
 
 class SuperuserAPITests(InvenTreeAPITestCase):
@@ -390,20 +615,20 @@ class UserTokenTests(InvenTreeAPITestCase):
         # Request the token with the same name
         data = self.get(url, data={'name': 'cat'}, expected_code=200).data
 
-        self.assertEqual(data['token'], token.key)
+        token.refresh_from_db()
+        self.assertNotEqual(data['token'], token.key)
+        self.assertTrue(data['token'].startswith('inv-2-'))
+        self.assertTrue(token.revoked)
 
-        self.assertEqual(ApiToken.objects.count(), 3)
+        self.assertEqual(ApiToken.objects.count(), 4)
 
-        # Revoke the token, and then request again
-        token.revoked = True
-        token.save()
-
+        # Request again, which issues another replacement token
         data = self.get(url, data={'name': 'cat'}, expected_code=200).data
 
         self.assertNotEqual(data['token'], token.key)
 
         # A new token has been generated
-        self.assertEqual(ApiToken.objects.count(), 4)
+        self.assertEqual(ApiToken.objects.count(), 5)
 
         # Test with a really long name
         data = self.get(url, data={'name': 'cat' * 100}, expected_code=200).data
@@ -426,6 +651,53 @@ class UserTokenTests(InvenTreeAPITestCase):
         for k in keys:
             self.assertIn(k, token.metadata)
 
+    def test_token_issued_notification(self):
+        """A notification is sent whenever a token is issued, with a warning if email is unavailable."""
+        self.ensurePluginsLoaded()
+
+        url = reverse('api-token')
+        category = 'users.api_token_issued'
+
+        self.assertEqual(
+            NotificationMessage.objects.filter(category=category).count(), 0
+        )
+
+        # No email configured -> warning is returned, UI notification is still created
+        with self.assertLogs('inventree', level='WARNING') as logs:
+            data = self.get(url, data={'name': 'notify'}, expected_code=200).data
+
+        self.assertIn('warning', data)
+        self.assertIn('Email is not configured', data['warning'])
+        self.assertTrue(any('INVE-W7' in msg for msg in logs.output))
+
+        msgs = NotificationMessage.objects.filter(category=category, user=self.user)
+        self.assertEqual(msgs.count(), 1)
+        self.assertIn("'notify'", msgs.first().message)
+
+        # Re-issuing a token with the same name sends another notification
+        self.get(url, data={'name': 'notify'}, expected_code=200)
+        self.assertEqual(msgs.count(), 2)
+
+        # Email configured -> no warning
+        with self.settings(EMAIL_HOST='localhost', TESTING_BYPASS_MAILCHECK=True):
+            data = self.get(url, data={'name': 'mailed'}, expected_code=200).data
+        self.assertNotIn('warning', data)
+
+        # Superuser issuing a token for another user notifies that user
+        self.user.is_superuser = True
+        self.user.save()
+        other = User.objects.exclude(pk=self.user.pk).first()
+
+        data = self.post(
+            reverse('api-token-list'),
+            data={'name': 'for-other', 'user': other.pk},
+            expected_code=201,
+        ).data
+        self.assertIn('warning', data)
+
+        msg = NotificationMessage.objects.get(category=category, user=other)
+        self.assertIn(self.user.username, msg.message)
+
     def test_token_auth(self):
         """Test user token authentication."""
         # Create a new token
@@ -444,7 +716,7 @@ class UserTokenTests(InvenTreeAPITestCase):
         # Grab the token, and update
         token = ApiToken.objects.first()
         assert token
-        self.assertEqual(token.key, token_key)
+        self.assertEqual(token.key, ApiToken.split_token(token_key)[0])
         self.assertIsNotNone(token.last_seen)
 
         # Revoke the token
@@ -485,7 +757,7 @@ class UserTokenTests(InvenTreeAPITestCase):
             url=reverse('api-token'), data={'name': 'race'}, expected_code=200
         ).data['token']
 
-        token = ApiToken.objects.get(key=token_key)
+        token = ApiToken.objects.get(key=ApiToken.split_token(token_key)[0])
 
         # Force last_seen to be 'stale' so the auth backend attempts to update it
         ApiToken.objects.filter(pk=token.pk).update(
@@ -521,23 +793,54 @@ class UserTokenTests(InvenTreeAPITestCase):
         # Get token
         response = self.get(reverse('api-token'), expected_code=200)
         self.assertIn('token', response.data)
+        raw_token = response.data['token']
+
+        self.client.logout()
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {raw_token}')
 
         # Now there should be one token
         response = self.get(url, expected_code=200)
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]['active'], True)
         self.assertEqual(response.data[0]['revoked'], False)
-        self.assertEqual(response.data[0]['in_use'], False)
+        self.assertEqual(response.data[0]['in_use'], True)
+        self.assertEqual(response.data[0]['issued_by'], self.user.pk)
+        self.assertIsNone(response.data[0]['revoked_by'])
+        self.assertIsNone(response.data[0]['revocation_reason'])
         expected_day = str(
             datetime.datetime.now().date() + datetime.timedelta(days=365)
         )
         self.assertEqual(response.data[0]['expiry'], expected_day)
 
         # Destroy token
+        token_id = response.data[0]['id']
         self.delete(
-            reverse('api-token-detail', kwargs={'pk': response.data[0]['id']}),
+            reverse('api-token-detail', kwargs={'pk': token_id}),
+            data={'revocation_reason': 'No longer needed'},
             expected_code=204,
         )
+
+        token = ApiToken.objects.get(pk=token_id)
+        self.assertTrue(token.revoked)
+        self.assertEqual(token.revoked_by, self.user)
+        self.assertEqual(token.revocation_reason, 'No longer needed')
+
+        # Revoking again must not overwrite the original revocation record
+        other_user = User.objects.create_user(username='other-revoker', password='x')
+        other_user.is_superuser = True
+        other_user.save()
+        self.client.force_authenticate(user=other_user)
+        self.delete(
+            reverse('api-token-detail', kwargs={'pk': token_id}) + '?all_users=true',
+            data={'revocation_reason': 'Overwritten reason'},
+            expected_code=204,
+        )
+        self.client.force_authenticate(user=None)
+
+        token.refresh_from_db()
+        self.assertTrue(token.revoked)
+        self.assertEqual(token.revoked_by, self.user)
+        self.assertEqual(token.revocation_reason, 'No longer needed')
 
         # Get token without auth (should fail)
         self.client.logout()
@@ -564,6 +867,148 @@ class UserTokenTests(InvenTreeAPITestCase):
         self.assertIn('token', response.data)
 
         self.assertEqual(ApiToken.objects.count(), 1)
+
+    def test_token_create_fields(self):
+        """Test that protected token fields cannot be set when creating a token."""
+        url = reverse('api-token-list')
+        today = InvenTree.helpers.current_date()
+        other = User.objects.create_user(username='other', password='password')
+
+        # Expiry date must be within the allowed token lifetime
+        for expiry in [today - datetime.timedelta(days=1), datetime.date(9999, 12, 31)]:
+            response = self.post(
+                url, data={'name': 'test', 'expiry': str(expiry)}, expected_code=400
+            )
+            self.assertIn('expiry', response.data)
+
+        for expiry in [today, today + datetime.timedelta(days=365)]:
+            response = self.post(
+                url,
+                data={'name': f'test-{expiry}', 'expiry': str(expiry)},
+                expected_code=201,
+            )
+            self.assertEqual(response.data['expiry'], str(expiry))
+
+        # Read-only fields are ignored
+        response = self.post(
+            url,
+            data={
+                'name': 'protected',
+                'revoked': True,
+                'revoked_by': other.pk,
+                'issued_by': other.pk,
+                'revocation_reason': 'forged',
+                'token_version': 1,
+                'last_seen': str(today),
+            },
+            expected_code=201,
+        )
+
+        token = ApiToken.objects.get(pk=response.data['id'])
+        self.assertFalse(token.revoked)
+        self.assertIsNone(token.revoked_by)
+        self.assertEqual(token.issued_by, self.user)
+        self.assertIsNone(token.revocation_reason)
+        self.assertEqual(token.token_version, 2)
+        self.assertIsNone(token.last_seen)
+
+    def set_auth_time(self, age: float):
+        """Record an allauth authentication event in the test client session.
+
+        Arguments:
+            age: How many seconds ago the authentication occurred
+        """
+        session = self.client.session
+        session[AUTHENTICATION_METHODS_SESSION_KEY] = [
+            {'method': 'mfa', 'type': 'totp', 'at': time.time() - age}
+        ]
+        session.save()
+
+    def test_token_mfa_reauthentication(self):
+        """Test that MFA users must have recently authenticated to mint a token.
+
+        Every endpoint which issues a new API token must enforce this check.
+        Otherwise an aged (or stolen) session could be converted into a
+        long-lived API token without the second factor.
+        """
+        Authenticator.objects.create(
+            user=self.user, type=Authenticator.Type.TOTP, data={'secret': 'abc'}
+        )
+
+        n_tokens = ApiToken.objects.filter(user=self.user).count()
+
+        endpoints = [
+            lambda name: self.get(
+                reverse('api-token'), data={'name': name}, expected_code=None
+            ),
+            lambda name: self.get(
+                reverse('api-token_legacy'), data={'name': name}, expected_code=None
+            ),
+            lambda name: self.post(
+                reverse('api-token-list'), data={'name': name}, expected_code=None
+            ),
+        ]
+
+        # No authentication record, or an aged one: reauthentication is required
+        for age in [None, 600]:
+            if age is not None:
+                self.set_auth_time(age)
+
+            for idx, mint in enumerate(endpoints):
+                response = mint(f'mfa-{age}-{idx}')
+                self.assertEqual(response.status_code, 401, response.data)
+                self.assertEqual(response.data['id'], 'reauthentication_required')
+
+                flows = [flow['id'] for flow in response.data['data']['flows']]
+                self.assertIn('mfa_reauthenticate', flows)
+
+        # No tokens were issued
+        self.assertEqual(ApiToken.objects.filter(user=self.user).count(), n_tokens)
+
+        # After recent (re)authentication, tokens can be issued
+        self.set_auth_time(10)
+
+        self.get(reverse('api-token'), data={'name': 'mfa-ok-0'}, expected_code=200)
+        response = self.post(
+            reverse('api-token-list'), data={'name': 'mfa-ok-1'}, expected_code=201
+        )
+        self.assertIn('token', response.data)
+
+        self.assertEqual(ApiToken.objects.filter(user=self.user).count(), n_tokens + 2)
+
+    def test_token_v1(self):
+        """Test that v1 API tokens still work."""
+        # Create a v1 token via model - this is NOT recommended; use v2 tokens
+        token = ApiToken.objects.create(
+            user=self.user,
+            key=default_token(),
+            token_version=1,
+            expiry=datetime.datetime.now() + datetime.timedelta(days=365),
+        )
+        token_key = token.key
+        self.assertTrue(token_key.startswith('inv-'))
+
+        # Check match and validate functions
+        self.assertTrue(token.match(token_key))
+        self.assertTrue(token.validate(token_key))
+
+        # test api access with token
+        self.logout()
+        # false test - ensure that without the token, access is denied
+        self.get(reverse('api-user-me'), expected_code=401)
+
+        # valid test
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token_key}')
+        response = self.get(reverse('api-user-me'), expected_code=200)
+        self.assertEqual(response.data['username'], self.user.username)
+
+        # check if info view also works
+        response_data = self.get(
+            reverse('api-inventree-info'), expected_code=200
+        ).json()
+        # staff users are allowed to see the database field
+        self.assertIn('database', response_data)
+        self.assertIsNotNone(response_data.get('database'))
 
 
 class GroupDetailTests(InvenTreeAPITestCase):

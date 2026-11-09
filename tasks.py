@@ -20,13 +20,22 @@ import invoke
 from invoke import Collection, task
 from invoke.exceptions import Exit, UnexpectedExit
 
+try:
+    import structlog
+
+    logger = structlog.get_logger('inventree')
+except ImportError:
+    import logging
+
+    logger = logging.getLogger('inventree')
+
 
 def safe_value(fnc):
     """Helper function to safely get value from function, catching import exceptions."""
     try:
         return fnc()
     except (ModuleNotFoundError, ImportError):
-        return wrap_color('N/A', '93')  # Yellow color for "Not Available"
+        return wrap_color('N/A', 93)  # Yellow color for "Not Available"
 
 
 def is_true(x):
@@ -167,28 +176,36 @@ def wrap_color(text: str, color: str) -> str:
     return f'\033[{color}m{text}\033[0m'
 
 
+JSON_LOG = os.environ.get('INVENTREE_JSON_LOG', 'false').lower() == 'true'
+COLOR_MAP = {92: 20, 91: 40, 93: 30, 94: 20}
+
+
+def _structured_logging(color: int, *args):
+    msg = ' '.join(map(str, args))
+    if JSON_LOG:
+        logger.log(COLOR_MAP.get(color, 10), msg)
+    else:
+        print(wrap_color(msg, str(color)))
+
+
 def success(*args):
     """Print a success message to the console."""
-    msg = ' '.join(map(str, args))
-    print(wrap_color(msg, '92'))
+    _structured_logging(92, *args)
 
 
 def error(*args):
     """Print an error message to the console."""
-    msg = ' '.join(map(str, args))
-    print(wrap_color(msg, '91'))
+    _structured_logging(91, *args)
 
 
 def warning(*args):
     """Print a warning message to the console."""
-    msg = ' '.join(map(str, args))
-    print(wrap_color(msg, '93'))
+    _structured_logging(93, *args)
 
 
 def info(*args):
     """Print an informational message to the console."""
-    msg = ' '.join(map(str, args))
-    print(wrap_color(msg, '94'))
+    _structured_logging(94, *args)
 
 
 def state_logger(fn=None, method_name=None):
@@ -326,6 +343,7 @@ def builtin_apps():
         'machine',
         'order',
         'part',
+        'pricing',
         'report',
         'stock',
         'users',
@@ -334,6 +352,7 @@ def builtin_apps():
         'generic',
         'machine',
         'web',
+        'scim',
     ]
 
 
@@ -1084,13 +1103,13 @@ def migrate(c, detect: bool = False, verbose: bool = False):
     info('Running InvenTree database migrations...')
 
     if detect:
-        manage(c, 'makemigrations', verbose=verbose)
+        manage(c, 'makemigrations --traceback', verbose=verbose)
 
     manage(c, 'runmigrations', pty=True, verbose=verbose)
-    manage(c, 'migrate --run-syncdb', verbose=verbose)
+    manage(c, 'migrate --run-syncdb --traceback', verbose=verbose)
     manage(
         c,
-        'remove_stale_contenttypes --include-stale-apps --no-input',
+        'remove_stale_contenttypes --include-stale-apps --no-input --traceback',
         pty=True,
         verbose=verbose,
     )
@@ -1204,9 +1223,14 @@ def update(
         'exclude_plugins': 'Exclude plugin data from the output file (default = False)',
         'include_sso': 'Include SSO token data in the output file (default = False)',
         'include_session': 'Include user session data in the output file (default = False)',
+        'include_remote_addr': 'Include remote IP addresses for audit log entries in the output file (default = False)',
+        'prettify': 'Pretty-print the output file with indentation (default = False)',
+        'bulk': 'Use bulkdumpdata for improved performance on large datasets (default = False)',
         'verbose': 'Print verbose output from management commands',
+        'summary': 'Write a summary of the exported records (record counts and metadata) to the specified JSON file',
     }
 )
+@state_logger
 def export_records(
     c,
     filename='data.json',
@@ -1217,7 +1241,11 @@ def export_records(
     exclude_plugins: bool = False,
     include_sso: bool = False,
     include_session: bool = False,
+    include_remote_addr: bool = False,
+    prettify: bool = False,
+    bulk: bool = False,
     verbose: bool = False,
+    summary: Optional[str] = None,
 ):
     """Export all database records to a file."""
     # Get an absolute path to the file
@@ -1225,11 +1253,21 @@ def export_records(
     if not target.is_absolute():
         target = local_dir().joinpath(filename).resolve()
 
+    summary_target = None
+
+    if summary:
+        summary_target = Path(summary)
+        if not summary_target.is_absolute():
+            summary_target = local_dir().joinpath(summary).resolve()
+
     info(f"Exporting database records to file '{target}'")
 
     wait(c, verbose=verbose)
 
     check_file_existence(target, overwrite)
+
+    if summary_target:
+        check_file_existence(summary_target, overwrite)
 
     excludes = content_excludes(
         allow_email=include_email,
@@ -1242,7 +1280,10 @@ def export_records(
     with tempfile.NamedTemporaryFile(
         suffix='.json', encoding='utf-8', mode='w+t', delete=True
     ) as tmpfile:
-        cmd = f"dumpdata --natural-foreign --indent 2 --output '{tmpfile.name}' {excludes}"
+        cmd = f"{'bulkdumpdata' if bulk else 'dumpdata'} --natural-foreign --output '{tmpfile.name}' {excludes}"
+
+        if prettify:
+            cmd += ' --indent 2'
 
         # Dump data to temporary file
         manage(c, cmd, pty=True, verbose=verbose)
@@ -1252,41 +1293,82 @@ def export_records(
         tmpfile.seek(0)
         data = json.loads(tmpfile.read())
 
-    data_out = [
-        {
-            'metadata': True,
-            'comment': 'This file contains a dump of the InvenTree database',
-            'exported_at': datetime.datetime.now().isoformat(),
-            'exported_at_utc': datetime.datetime.utcnow().isoformat(),
-            'source_version': get_inventree_version(),
-            'api_version': get_inventree_api_version(),
-            'django_version': get_django_version(),
-            'python_version': python_version(),
-            'source_commit': get_commit_hash(),
-            'installed_apps': installed_apps(c),
-        }
-    ]
+    metadata_entry = {
+        'metadata': True,
+        'comment': 'This file contains a dump of the InvenTree database',
+        'exported_at': datetime.datetime.now().isoformat(),
+        'exported_at_utc': datetime.datetime.now(datetime.UTC).isoformat(),
+        'source_version': get_inventree_version(),
+        'api_version': get_inventree_api_version(),
+        'django_version': get_django_version(),
+        'python_version': python_version(),
+        'source_commit': get_commit_hash(),
+        'installed_apps': installed_apps(c),
+    }
 
-    for entry in data:
-        model_name = entry.get('model', None)
+    def entries_out():
+        """Filter and adjust entries as they are written, without ever materializing a second copy of the entire (potentially huge) dataset in memory.
 
-        # Ignore any temporary settings (start with underscore)
-        if model_name in ['common.inventreesetting', 'common.inventreeusersetting']:
-            if entry['fields'].get('key', '').startswith('_'):
-                continue
+        Yields:
+            dict: The next entry to write to the output file.
+        """
+        yield metadata_entry
 
-        if include_permissions is False:
-            if model_name == 'auth.group':
-                entry['fields']['permissions'] = []
+        for entry in data:
+            model_name = entry.get('model', None)
 
-            if model_name == 'auth.user':
-                entry['fields']['user_permissions'] = []
+            # Ignore any temporary settings (start with underscore)
+            if model_name in ['common.inventreesetting', 'common.inventreeusersetting']:
+                if entry['fields'].get('key', '').startswith('_'):
+                    continue
 
-        data_out.append(entry)
+            if include_permissions is False:
+                if model_name == 'auth.group':
+                    entry['fields']['permissions'] = []
 
-    # Write the processed data to file
+                if model_name == 'auth.user':
+                    entry['fields']['user_permissions'] = []
+
+            # Remove remote IP addresses from audit log entries
+            if include_remote_addr is False and model_name == 'audit.auditlogentry':
+                entry['fields']['remote_addr'] = None
+
+            yield entry
+
+    indent = 2 if prettify else None
+
+    # Number of exported records, for each model type
+    record_counts: dict[str, int] = {}
+
+    # Write the processed data to file, one entry at a time - avoids ever
+    # holding a second full copy of the (potentially huge) dataset in memory,
+    # and avoids a single json.dumps() call across the entire dataset at once
     with open(target, 'w', encoding='utf-8') as f_out:
-        f_out.write(json.dumps(data_out, indent=2))
+        f_out.write('[')
+        for i, entry in enumerate(entries_out()):
+            if i:
+                f_out.write(',')
+            if prettify:
+                f_out.write('\n')
+            f_out.write(json.dumps(entry, indent=indent))
+
+            if model_name := entry.get('model'):
+                record_counts[model_name] = record_counts.get(model_name, 0) + 1
+        if prettify:
+            f_out.write('\n')
+        f_out.write(']')
+
+    if summary_target:
+        info(f"Writing export summary to file '{summary_target}'")
+
+        summary_data = {
+            'metadata': metadata_entry,
+            'total_records': sum(record_counts.values()),
+            'records': dict(sorted(record_counts.items())),
+        }
+
+        with open(summary_target, 'w', encoding='utf-8') as f_out:
+            json.dump(summary_data, f_out, indent=2)
 
     success('Data export completed')
 
@@ -1357,10 +1439,15 @@ def validate_import_metadata(
         'exclude_plugins': 'Exclude plugin data from the import process (default = False)',
         'skip_migrations': 'Skip the migration step after clearing data (default = False)',
         'verbose': 'Print verbose output from management commands',
+        'bulk': 'Use the faster bulkloaddata command instead of loaddata (default = False)',
+        'ignore_conflicts': 'Skip records that violate a unique constraint, instead of raising an error (requires --bulk, default = False)',
+        'rebuild_trees': 'Rebuild MPTT tree structures after import (default = True)',
+        'rebuild_images': 'Rebuild image thumbnails after import (default = True)',
     },
     pre=[wait],
-    post=[rebuild_models, rebuild_thumbnails],
+    post=[],
 )
+@state_logger
 def import_records(
     c,
     filename='data.json',
@@ -1370,6 +1457,10 @@ def import_records(
     ignore_nonexistent: bool = False,
     skip_migrations: bool = False,
     verbose: bool = False,
+    bulk: bool = False,
+    ignore_conflicts: bool = False,
+    rebuild_trees: bool = True,
+    rebuild_images: bool = True,
 ):
     """Import database records from a file."""
     # Get an absolute path to the supplied filename
@@ -1381,6 +1472,10 @@ def import_records(
     if not target.exists():
         error(f"ERROR: File '{target}' does not exist")
         sys.exit(1)
+
+    if ignore_conflicts and not bulk:
+        warning('--ignore-conflicts has no effect without --bulk - ignoring')
+        ignore_conflicts = False
 
     if clear:
         delete_data(c, force=True, migrate=True, verbose=verbose)
@@ -1415,6 +1510,8 @@ def import_records(
         """Helper function to save data to a temporary file, and then load into the database."""
         nonlocal ignore_nonexistent
         nonlocal verbose
+        nonlocal bulk
+        nonlocal ignore_conflicts
         nonlocal c
 
         # Skip if there is no data to load
@@ -1428,7 +1525,9 @@ def import_records(
         ) as f_out:
             f_out.write(json.dumps(data, indent=2))
 
-        cmd = f'loaddata {f_out.name} -v 0 --force-color'
+        cmd = (
+            f'{"bulkloaddata" if bulk else "loaddata"} {f_out.name} -v 0 --force-color'
+        )
 
         if app:
             cmd += f' --app {app}'
@@ -1436,9 +1535,12 @@ def import_records(
         if ignore_nonexistent:
             cmd += ' --ignorenonexistent'
 
+        if bulk and ignore_conflicts:
+            cmd += ' --ignore-conflicts'
+
         # A set of content types to exclude from the import process
         if excludes:
-            cmd += f' -i {excludes}'
+            cmd += f' {excludes}'
 
         manage(c, cmd, pty=True, verbose=verbose)
 
@@ -1451,17 +1553,17 @@ def import_records(
 
         if model := entry.get('model', None):
             # Clear out any permissions specified for a group
+            # (these are regenerated after import)
             if model == 'auth.group':
                 entry['fields']['permissions'] = []
 
             # Clear out any permissions specified for a user
+            # (these are regenerated after import)
             if model == 'auth.user':
                 entry['fields']['user_permissions'] = []
 
             # Handle certain model types separately, to ensure they are loaded in the correct order
-            if model.startswith('auth.'):
-                auth_data.append(entry)
-            if model.startswith('users.'):
+            if model.startswith(('auth.', 'users.')):
                 auth_data.append(entry)
             elif model.startswith('common.'):
                 common_data.append(entry)
@@ -1497,6 +1599,12 @@ def import_records(
 
     load_data('remaining', all_data, excludes=content_excludes(allow_auth=False))
 
+    if rebuild_trees:
+        rebuild_models(c)
+
+    if rebuild_images:
+        rebuild_thumbnails(c)
+
     success('Data import completed')
 
 
@@ -1515,18 +1623,24 @@ def delete_data(c, force: bool = False, migrate: bool = False, verbose: bool = F
     info('Deleting existing data from InvenTree database...')
 
     if migrate:
-        manage(c, 'migrate --run-syncdb', verbose=verbose)
+        manage(c, 'migrate --run-syncdb --traceback', verbose=verbose)
 
     if force:
-        manage(c, 'flush --noinput', verbose=verbose)
+        manage(c, 'flush --traceback --noinput', verbose=verbose)
     else:
-        manage_interactive('flush', verbose=verbose)
+        manage_interactive('flush --traceback', verbose=verbose)
 
     success('Existing data deleted')
 
 
-@task(post=[rebuild_models, rebuild_thumbnails])
-def import_fixtures(c):
+@task(
+    post=[rebuild_models, rebuild_thumbnails],
+    help={
+        'clear': 'Clear existing data before importing fixtures',
+        'verbose': 'Print verbose output from management commands',
+    },
+)
+def import_fixtures(c, clear: bool = False, verbose: bool = False):
     """Import fixture data into the database.
 
     This command imports all existing test fixture data into the database.
@@ -1536,6 +1650,9 @@ def import_fixtures(c):
         - Running this command may overwrite existing database data!!
         - Don't say you were not warned...
     """
+    if clear:
+        delete_data(c, force=True, verbose=verbose)
+
     fixtures = [
         # Build model
         'build',
@@ -1563,7 +1680,7 @@ def import_fixtures(c):
 
     command = 'loaddata ' + ' '.join(fixtures)
 
-    manage(c, command, pty=True)
+    manage(c, command, pty=True, verbose=verbose)
 
 
 # Execution tasks
@@ -1665,15 +1782,33 @@ def server_health(c, address: str = 'http://localhost:8000', timeout: int = 5):
     """Check if the web server is healthy by requesting /api/system/health/.
 
     Exits 0 on HTTP 200, 1 otherwise.
-    No Django startup required.
+    Django startup only required when when INVENTREE_SITE_URL is not set
+    and no docker/devcontainer/pkg-installer env vars are set. Django exceptions
+    caught and logged as warnings, but do not cause the health check to fail.
     """
     import urllib.error
+    import urllib.parse
     import urllib.request
 
+    from src.backend.InvenTree.InvenTree.config import (  # type: ignore[import]
+        get_setting,
+    )
+
     url = f'{address.rstrip("/")}/api/system/health/'
+    site_url = None
 
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        site_url = get_setting('INVENTREE_SITE_URL', 'site_url', None)
+    except (Exception, SystemExit) as exc:
+        warning(f'Could not determine configured site URL: {exc}')
+
+    request = urllib.request.Request(url)
+
+    if site_url and (hostname := urllib.parse.urlparse(site_url).hostname):
+        request.add_header('Host', hostname)
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             if response.status == 200:
                 success(f'Server is healthy ({url})')
                 return
@@ -1766,6 +1901,7 @@ def test_translations(c):
         'translations': 'Compile translations before running tests',
         'keepdb': 'Keep the test database after running tests (default = False)',
         'pytest': 'Use pytest to run tests',
+        'parallel': 'Set number of parallel test processes (default = off)',
         'verbosity': 'Verbosity level for test output (default = 1)',
     }
 )
@@ -1780,6 +1916,7 @@ def test(
     translations: bool = False,
     keepdb: bool = False,
     pytest: bool = False,
+    parallel: Optional[int] = None,
     verbosity: int = 1,
 ):
     """Run unit-tests for InvenTree codebase.
@@ -1829,6 +1966,9 @@ def test(
     cmd += ' --exclude-tag performance_test'
 
     cmd += f' --verbosity {verbosity}'
+
+    if parallel:
+        cmd += f' --parallel {parallel}'
 
     if coverage:
         # Run tests within coverage environment, and generate report
@@ -2037,6 +2177,10 @@ def export_definitions(c, basedir: str = ''):
         base_path.joinpath('inventree_tags.yml'),
         base_path.joinpath('inventree_filters.yml'),
         base_path.joinpath('inventree_report_context.json'),
+        base_path.joinpath('inventree_status_codes.json'),
+        base_path.joinpath('inventree_roles.json'),
+        base_path.joinpath('inventree_audited_models.json'),
+        base_path.joinpath('inventree_fsm.json'),
     ]
 
     info('Exporting definitions...')
@@ -2050,6 +2194,18 @@ def export_definitions(c, basedir: str = ''):
 
     check_file_existence(filenames[3], overwrite=True)
     manage(c, f'export_report_context {filenames[3]}', pty=True)
+
+    check_file_existence(filenames[4], overwrite=True)
+    manage(c, f'export_status_codes {filenames[4]}', pty=True)
+
+    check_file_existence(filenames[5], overwrite=True)
+    manage(c, f'export_roles {filenames[5]}', pty=True)
+
+    check_file_existence(filenames[6], overwrite=True)
+    manage(c, f'export_audited_models {filenames[6]}', pty=True)
+
+    check_file_existence(filenames[7], overwrite=True)
+    manage(c, f'export_fsm {filenames[7]}', pty=True)
 
     info('Exporting definitions complete')
 
@@ -2473,7 +2629,7 @@ def docs_server(
     compile_schema: bool = False,
     export_settings: bool = True,
 ):
-    """Start a local mkdocs server to view the documentation."""
+    """Start a local properdocs server to view the documentation."""
     # Extract settings definitions
     if export_settings:
         export_definitions(c, basedir='docs')
@@ -2481,7 +2637,7 @@ def docs_server(
     if compile_schema:
         doc_schema(c)
 
-    run(c, f'mkdocs serve -a {address} -f docs/mkdocs.yml')
+    run(c, f'properdocs serve -a {address} -f docs/mkdocs.yml')
 
 
 @task(
@@ -2494,7 +2650,7 @@ def build_docs(c, mkdocs=False):
     doc_schema(c)
 
     if mkdocs:
-        run(c, 'mkdocs build  -f docs/mkdocs.yml')
+        run(c, 'properdocs build  -f docs/mkdocs.yml')
         info('Documentation build complete')
     else:
         info('Documentation build complete, but mkdocs not requested')

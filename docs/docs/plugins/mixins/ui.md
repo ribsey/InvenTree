@@ -187,6 +187,14 @@ The `get_ui_template_previews` feature type can be used to provide custom templa
 
 The `get_ui_primary_actions` method can be used to provide custom primary action, which are rendered in the header of the page, next to the title/name and any status indicators. These primary actions are typically used to provide quick access to common actions related to the current page.
 
+The `context` dictionary provided to this method contains the following keys:
+
+| Key | Description |
+| --- | --- |
+| `location` | The URL path of the current page |
+| `target_model` | The model type of the current page (e.g. `part`), or the page key for index pages (e.g. `purchasing`). Not provided for all pages. |
+| `target_id` | The primary key of the instance displayed on the current page. Not provided for all pages. |
+
 ::: plugin.base.ui.mixins.UserInterfaceMixin.get_ui_primary_actions
     options:
       show_bases: False
@@ -196,6 +204,40 @@ The `get_ui_primary_actions` method can be used to provide custom primary action
         show_source: True
       summary: False
       members: []
+
+### Routes
+
+The `get_ui_routes` method can be used to provide custom routes (and therefore pages) within the InvenTree web interface.
+
+::: plugin.base.ui.mixins.UserInterfaceMixin.get_ui_routes
+    options:
+      show_bases: False
+      show_root_heading: False
+      show_root_toc_entry: False
+      summary: False
+      members: []
+      extra:
+        show_source: True
+
+A route is defined by returning a list of route definitions:
+
+```python
+def get_ui_routes(self, request, context, **kwargs):
+    return [
+        {
+            'key': 'my-plugin-page',
+            'title': 'My Plugin Page',
+            'source': self.plugin_static_file('my_page.js:getFeature'),
+            'options': {
+                'path': 'page/:pk',
+            },
+        },
+    ]
+```
+
+Routes are exposed below `/web/plugin/<plugin-name>/`. For example, the route above would be available at: `/web/plugin/my-plugin/page/<pk>`
+
+The path is relative to the plugin's own URL namespace and uses React Router path syntax, so parameters can be specified using :parameter notation.
 
 ## Plugin Context
 
@@ -215,7 +257,7 @@ When distributing a custom UI plugin, the plugin should include the necessary fr
 
 The simplest (and recommended) way to achieve this is to distribute the compiled javascript files with the plugin package, in a top-level `static` directory. This directory will be automatically collected by InvenTree when the plugin is installed, and the files will be copied to the appropriate location.
 
-Read more about [static plugin files](../index.md#static-files) for more information.
+Read more about [static plugin files](../develop.md#static-files) for more information.
 
 ## Sample Plugin
 

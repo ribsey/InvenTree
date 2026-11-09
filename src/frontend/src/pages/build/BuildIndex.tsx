@@ -112,13 +112,17 @@ export default function BuildIndex() {
     ];
   }, [user, buildOrderView]);
 
-  if (!user.isLoggedIn() || !user.hasViewRole(UserRoles.build)) {
+  if (!user.isLoggedIn() || !user.hasViewVisible(UserRoles.build)) {
     return <PermissionDenied />;
   }
 
   return (
     <Stack>
-      <PageDetail title={t`Manufacturing`} actions={[]} />
+      <PageDetail
+        model={PluginPanelKey.manufacturing}
+        title={t`Manufacturing`}
+        actions={[]}
+      />
       <PanelGroup
         pageKey='build-index'
         panels={panels}

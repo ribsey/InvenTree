@@ -30,6 +30,9 @@ import {
 import InstanceDetail from '../../components/nav/InstanceDetail';
 import { PageDetail } from '../../components/nav/PageDetail';
 import AttachmentPanel from '../../components/panels/AttachmentPanel';
+import HistoryPanel, {
+  useShowHistoryPanel
+} from '../../components/panels/HistoryPanel';
 import NotesPanel from '../../components/panels/NotesPanel';
 import { PanelGroup } from '../../components/panels/PanelGroup';
 import ParametersPanel from '../../components/panels/ParametersPanel';
@@ -40,6 +43,7 @@ import {
   useEditApiFormModal
 } from '../../hooks/UseForm';
 import { useInstance } from '../../hooks/UseInstance';
+import { useInstanceInfo } from '../../hooks/UseInstanceInfo';
 import useStatusCodes from '../../hooks/UseStatusCodes';
 import { useGlobalSettingsState } from '../../states/SettingsStates';
 import { useUserState } from '../../states/UserState';
@@ -73,6 +77,11 @@ export default function SalesOrderDetail() {
     }
   });
 
+  const { instanceInfo } = useInstanceInfo({
+    modelType: ModelType.salesorder,
+    modelId: order?.pk
+  });
+
   const orderCurrency = useMemo(() => {
     return (
       order.order_currency ||
@@ -101,7 +110,6 @@ export default function SalesOrderDetail() {
     pk: order.pk,
     title: t`Edit Sales Order`,
     fields: salesOrderFields,
-    queryParams: new URLSearchParams({ tags: 'true' }),
     onFormSuccess: () => {
       refreshInstance();
     }
@@ -128,6 +136,8 @@ export default function SalesOrderDetail() {
     follow: true,
     modelType: ModelType.salesorder
   });
+
+  const showHistory = useShowHistoryPanel();
 
   const orderPanels: PanelType[] = useMemo(() => {
     return [
@@ -173,6 +183,7 @@ export default function SalesOrderDetail() {
               <Accordion.Panel>
                 <ExtraLineItemTable
                   endpoint={ApiEndpoints.sales_order_extra_line_list}
+                  importModelType='salesorderextraline'
                   orderId={order.pk}
                   editable={lineItemsEditable}
                   orderDetailRefresh={refreshInstance}
@@ -213,7 +224,7 @@ export default function SalesOrderDetail() {
         name: 'build-orders',
         label: t`Build Orders`,
         icon: <IconTools />,
-        hidden: !user.hasViewRole(UserRoles.build),
+        hidden: !user.hasViewVisible(UserRoles.build),
         content: order?.pk ? (
           <BuildOrderTable salesOrderId={order.pk} />
         ) : (
@@ -222,25 +233,32 @@ export default function SalesOrderDetail() {
       },
       ParametersPanel({
         model_type: ModelType.salesorder,
-        model_id: order.pk
+        model_id: order.pk,
+        parameter_count: instanceInfo.parameter_count
       }),
       AttachmentPanel({
         model_type: ModelType.salesorder,
-        model_id: order.pk
+        model_id: order.pk,
+        attachment_count: instanceInfo.attachment_count
       }),
       NotesPanel({
         model_type: ModelType.salesorder,
         model_id: order.pk,
-        has_note: !!order.notes,
+        note_count: instanceInfo.note_count,
         // TODO @matmair - change API to include a "locked" attribute that we can check here
         editable:
           order.status == soStatus.COMPLETE &&
           !globalSettings.isSet('SALESORDER_EDIT_COMPLETED_ORDERS')
             ? false
             : undefined
+      }),
+      HistoryPanel({
+        model_type: ModelType.salesorder,
+        model_id: order.pk,
+        visible: showHistory
       })
     ];
-  }, [order, id, user, soStatus, user]);
+  }, [order, id, user, soStatus, instanceInfo, showHistory]);
 
   const issueOrder = useCreateApiFormModal({
     url: apiUrl(ApiEndpoints.sales_order_issue, order.pk),
@@ -415,6 +433,8 @@ export default function SalesOrderDetail() {
       >
         <Stack gap='xs'>
           <PageDetail
+            model={ModelType.salesorder}
+            id={order.pk}
             title={`${t`Sales Order`}: ${order.reference}`}
             subtitle={subtitle}
             imageUrl={order.customer_detail?.image}

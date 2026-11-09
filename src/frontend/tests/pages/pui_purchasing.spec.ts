@@ -1,5 +1,6 @@
 import { expect } from '@playwright/test';
-import { test } from '../baseFixtures.ts';
+import { createApi } from '../api.ts';
+import { generateUUID, test } from '../baseFixtures.ts';
 import { readeruser, stevenuser } from '../defaults.ts';
 import {
   activateCalendarView,
@@ -14,7 +15,9 @@ import {
   setTableChoiceFilter,
   showCalendarView,
   showParametricView,
-  showTableView
+  showTableView,
+  tableSearch,
+  waitForDataOutput
 } from '../helpers.ts';
 import { doCachedLogin } from '../login.ts';
 
@@ -51,9 +54,7 @@ test('Purchasing - Index', async ({ browser }) => {
 
   // Check for expected values
   await clearTableFilters(page);
-  await page
-    .getByRole('textbox', { name: 'table-search-input' })
-    .fill('R_100K_0402');
+  await tableSearch(page, 'R_100K_0402');
   await page.getByText('R_100K_0402_1%').first().waitFor();
   await page.getByRole('cell', { name: 'RR05P100KDTR-ND' }).first().waitFor();
 
@@ -153,9 +154,7 @@ test('Purchasing - Manufacturer Parts', async ({ browser }) => {
     url: 'purchasing/index/manufacturer-parts'
   });
 
-  await page
-    .getByRole('textbox', { name: 'table-search-input' })
-    .fill('CPF0402B100KE1');
+  await tableSearch(page, 'CPF0402B100KE1');
   await page.getByText('R_100K_0402_1%').first().waitFor();
   await page.getByRole('cell', { name: 'CPF0402B100KE1' }).waitFor();
 
@@ -165,8 +164,9 @@ test('Purchasing - Manufacturer Parts', async ({ browser }) => {
   await page
     .getByRole('combobox', { name: 'choice-field-export_plugin' })
     .fill('CSV');
-  await page.getByRole('button', { name: 'Export', exact: true }).click();
-  await page.getByText('Process completed successfully').waitFor();
+  await waitForDataOutput(page, () =>
+    page.getByRole('button', { name: 'Export', exact: true }).click()
+  );
 
   await loadTab(page, 'Manufacturers');
   await page.getByText('Murata Electronics').waitFor();
@@ -258,6 +258,11 @@ test('Purchase Orders - Table', async ({ browser }) => {
   // Expected values
   await page.getByText('2025-06-12').waitFor(); // Start Date
   await page.getByText('2025-07-17').waitFor(); // Target Date
+
+  // Creator of the order should be displayed
+  await expect(page.getByRole('row', { name: 'Created By' })).toContainText(
+    'steven'
+  );
 });
 
 test('Purchase Orders - Calendar', async ({ browser }) => {
@@ -379,9 +384,11 @@ test('Purchase Orders - Price Breaks', async ({ browser }) => {
     url: 'purchasing/purchase-order/14/line-items'
   });
 
+  await page.getByRole('button', { name: 'action-menu-add-line-item' }).click();
   await page
-    .getByRole('button', { name: 'action-button-add-line-item' })
+    .getByRole('menuitem', { name: 'action-menu-add-line-item-add' })
     .click();
+
   await page.getByLabel('related-field-part').fill('002.01');
   await page.getByRole('option', { name: 'PCBWOY PCB-002.01' }).click();
 
@@ -581,7 +588,7 @@ test('Purchase Orders - Receive Items', async ({ browser }) => {
   await page.getByLabel('action-button-add-note').click();
 
   await page
-    .getByLabel('text-field-batch_code', { exact: true })
+    .getByLabel('text-field-line_batch_code', { exact: true })
     .fill('my-batch-code');
   await page.getByLabel('text-field-packaging', { exact: true }).fill('bucket');
   await page
@@ -599,10 +606,116 @@ test('Purchase Orders - Receive Items', async ({ browser }) => {
   await loadTab(page, 'Received Stock');
   await clearTableFilters(page);
 
-  await page
-    .getByRole('textbox', { name: 'table-search-input' })
-    .fill('my-batch-code');
+  await tableSearch(page, 'my-batch-code');
   await page.getByRole('cell', { name: 'my-batch-code' }).first().waitFor();
+});
+
+test('Purchase Orders - Custom Location', async ({ browser }) => {
+  // Unique batch code, so that retries do not match items from earlier attempts
+  const batchCode = `po-custom-location-${generateUUID().slice(0, 8)}`;
+  const page = await doCachedLogin(browser);
+
+  await navigate(page, 'purchasing/purchase-order/14/line-items');
+
+  // Line item pk=36 ("Widget Board" / 002.01-PCB) has no destination of its
+  // own, so it falls back to the order's default destination ("Mechanical
+  // Lab"). Target it via its target date, as its quantity gets bumped below
+  // (and its part / IPN are shared with another line on this order).
+  const row = page.getByRole('row').filter({ hasText: '2024-10-23' });
+  await row.waitFor();
+
+  // First, ensure that the row has sufficient quantity to receive
+  // This is required to ensure the robustness of this test,
+  // as the test data may be modified by other tests
+  await row.getByLabel(/row-action-menu-/i).click();
+  await page.getByRole('menuitem', { name: 'Edit' }).click();
+
+  const quantityInput = page.getByRole('textbox', {
+    name: 'number-field-quantity'
+  });
+  const quantity = Number.parseInt(await quantityInput.inputValue());
+  await quantityInput.fill((quantity + 100).toString());
+
+  await page.getByRole('button', { name: 'Submit' }).click();
+  await page.getByText('Item Updated').waitFor();
+
+  // Now, receive a single unit into a location *different* from the
+  // order's default destination ("Mechanical Lab")
+  await row.getByLabel(/row-action-menu-/i).click();
+  await page.getByRole('menuitem', { name: 'Receive line item' }).click();
+
+  // Wait for the form to apply its initial data (the order's destination),
+  // otherwise it can overwrite the location selected below
+  const locationField = page.getByLabel('tree-field-location');
+  await expect(locationField).toHaveValue(/Mechanical Lab/);
+
+  await expect(async () => {
+    await locationField.fill('storage room a');
+    await page
+      .getByText('Storage Room A (purple door)')
+      .click({ timeout: 5000 });
+    await expect(locationField).toHaveValue(/Storage Room A/, {
+      timeout: 2000
+    });
+  }).toPass({ timeout: 30000 });
+
+  await page.getByLabel('number-field-quantity').fill('1');
+  await page.waitForTimeout(500);
+
+  await page.getByLabel('action-button-assign-batch-').click();
+  await page
+    .getByLabel('text-field-line_batch_code', { exact: true })
+    .fill(batchCode);
+
+  // Short timeout to allow for debouncing
+  await page.waitForTimeout(200);
+
+  // Ensure the selected location has not been reset
+  await expect(locationField).toHaveValue(/Storage Room A/);
+
+  await page.getByRole('button', { name: 'Submit' }).click();
+  await page.getByText('Items received').waitFor();
+
+  // Verify (via the UI) that the item was received into the location we
+  // picked, and not the order's default destination
+  await loadTab(page, 'Received Stock');
+  await clearTableFilters(page);
+
+  await tableSearch(page, batchCode);
+
+  const receivedRow = page
+    .getByRole('row')
+    .filter({ hasText: batchCode })
+    .first();
+
+  await expect(receivedRow).toContainText('Storage Room A');
+  await expect(receivedRow).not.toContainText('Mechanical Lab');
+
+  // Cross-check against the API, in case the displayed location text does
+  // not reflect the stock item's actual location
+  const api = await createApi({});
+
+  const locations = await api
+    .get('stock/location/', { params: { search: 'Storage Room A' } })
+    .then((res) => res.json());
+  const targetLocation = locations.find(
+    (loc: any) => loc.name === 'Storage Room A'
+  );
+  expect(targetLocation).toBeTruthy();
+
+  const items = await api
+    .get('stock/', { params: { batch: batchCode } })
+    .then((res) => res.json());
+  expect(items.length).toBeGreaterThan(0);
+
+  // The batch code may be shared with stock items received by earlier runs
+  // of this test, so check the most recently-created one
+  const latestItem = items.reduce((a: any, b: any) => (b.pk > a.pk ? b : a));
+  expect(latestItem.location).toBe(targetLocation.pk);
+
+  // This supplier part has a pack quantity of 6, so receiving "1" (pack)
+  // should result in a stock item with a quantity of 6 (base units)
+  expect(latestItem.quantity).toBe(6);
 });
 
 test('Purchase Orders - Receive Virtual Items', async ({ browser }) => {

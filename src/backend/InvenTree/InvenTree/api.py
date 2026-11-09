@@ -8,15 +8,18 @@ from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
-from django.http import JsonResponse
+from django.http import HttpRequest, HttpResponsePermanentRedirect, JsonResponse
 from django.urls import path, reverse
+from django.utils.decorators import method_decorator
 from django.utils.translation import gettext_lazy as _
+from django.views.decorators.csrf import csrf_exempt
 from django.views.generic.base import RedirectView
 
 import structlog
 from django_q.models import OrmQ
 from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
 from rest_framework import permissions, serializers, viewsets
+from rest_framework.exceptions import AuthenticationFailed
 from rest_framework.generics import GenericAPIView
 from rest_framework.request import clone_request
 from rest_framework.response import Response
@@ -27,14 +30,15 @@ import InvenTree.config
 import InvenTree.filters
 import InvenTree.permissions
 import InvenTree.version
+from audit.helpers import write_batched
 from common.settings import get_global_setting
 from InvenTree import helpers, ready
 from InvenTree.auth_overrides import registration_enabled
 from InvenTree.mixins import ListCreateAPI
+from InvenTree.proof import calculate_proof
 from InvenTree.tasks import batch_offload_tasks
 from plugin.base.event.events import batch_events
 from plugin.serializers import MetadataSerializer
-from users.models import ApiToken
 from users.permissions import check_user_permission, prefetch_rule_sets
 
 from .helpers import plugins_info, str2bool
@@ -230,6 +234,7 @@ class InfoApiSerializer(serializers.Serializer):
     class SettingsSerializer(serializers.Serializer):
         """Serializer for InfoApiSerializer."""
 
+        sso_enabled = serializers.BooleanField()
         sso_registration = serializers.BooleanField()
         registration_enabled = serializers.BooleanField()
         password_forgotten_enabled = serializers.BooleanField()
@@ -245,6 +250,9 @@ class InfoApiSerializer(serializers.Serializer):
 
     server = serializers.CharField(read_only=True)
     id = serializers.CharField(read_only=True, allow_null=True)
+    link = serializers.CharField(
+        read_only=True, allow_null=True, help_text='Temporary identity proof'
+    )
     version = serializers.CharField(read_only=True)
     instance = serializers.CharField(read_only=True)
     apiVersion = serializers.IntegerField(read_only=True)  # noqa: N815
@@ -266,6 +274,8 @@ class InfoApiSerializer(serializers.Serializer):
     target = serializers.CharField(read_only=True, allow_null=True)
     django_admin = serializers.CharField(read_only=True)
     settings = SettingsSerializer(read_only=True, many=False)
+    """System state details that are mainly for warning purposes and do not require a hard API contract."""
+    system_state = serializers.JSONField(read_only=True)
 
 
 class InfoView(APIView):
@@ -281,11 +291,20 @@ class InfoView(APIView):
         return OrmQ.objects.count()
 
     @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                name='link_nonce',
+                type=str,
+                location=OpenApiParameter.QUERY,
+                required=False,
+                description='Nonce for short-term identity proof',
+            )
+        ],
         responses={
             200: OpenApiResponse(
                 response=InfoApiSerializer, description='InvenTree server information'
             )
-        }
+        },
     )
     def get(self, request, *args, **kwargs):
         """Serve current server information."""
@@ -329,29 +348,30 @@ class InfoView(APIView):
             if (is_staff and settings.INVENTREE_ADMIN_ENABLED)
             else None,
             'settings': {
+                'sso_enabled': get_global_setting('LOGIN_ENABLE_SSO'),
                 'sso_registration': registration_enabled('LOGIN_ENABLE_SSO_REG'),
                 'registration_enabled': registration_enabled('LOGIN_ENABLE_REG'),
                 'password_forgotten_enabled': get_global_setting(
                     'LOGIN_ENABLE_PWD_FORGOT'
                 ),
             },
+            'system_state': {'cors_allow_all': settings.CORS_ALLOW_ALL_ORIGINS},
         }
+        if nonce := request.query_params.get('link_nonce'):
+            data['link'] = calculate_proof(nonce)
 
         return JsonResponse(data)
 
     def check_auth_header(self, request):
         """Check if user is authenticated via a token in the header."""
         from InvenTree.middleware import get_token_from_request
+        from users.authentication import validate_api_token
 
         if token := get_token_from_request(request):
-            # Does the provided token match a valid user?
+            # Check if the token is valid and the user is a staff member
             try:
-                token = ApiToken.objects.get(key=token)
-
-                # Check if the token is active and the user is a staff member
-                if token.active and token.user and token.user.is_staff:
-                    return True
-            except ApiToken.DoesNotExist:
+                return validate_api_token(token).user.is_staff
+            except AuthenticationFailed:
                 pass
 
         return False
@@ -497,7 +517,7 @@ class BulkCreateMixin:
             if unique_create_fields := getattr(self, 'unique_create_fields', None):
                 existing = collections.defaultdict(list)
                 for idx, item in enumerate(data):
-                    key = tuple(item[v] for v in list(unique_create_fields))  # ty: ignore[not-subscriptable]
+                    key = tuple(item[v] for v in list(unique_create_fields))
                     existing[key].append(idx)
 
                 unique_errors = [[] for _ in range(len(data))]
@@ -513,7 +533,12 @@ class BulkCreateMixin:
                 if has_unique_errors:
                     raise ValidationError(unique_errors)
 
-            with transaction.atomic(), batch_events(), batch_offload_tasks():
+            with (
+                transaction.atomic(),
+                batch_events(),
+                batch_offload_tasks(),
+                write_batched(),
+            ):
                 for item in data:
                     serializer = self.get_serializer(data=item)
                     if serializer.is_valid():
@@ -643,13 +668,18 @@ class ParameterListMixin:
         serializer_class = (
             getattr(self, 'serializer_class', None) or self.get_serializer_class()
         )
-
-        model_class = serializer_class.Meta.model
+        model_class = getattr(getattr(serializer_class, 'Meta', None), 'model', None)
 
         # Apply ordering based on query parameter
-        queryset = common.filters.order_by_parameter(
-            queryset, model_class, self.request.query_params.get('ordering', None)
-        )
+        if model_class is not None:
+            ordering = (
+                self.request.query_params.get('ordering', None)
+                if hasattr(self, 'request')
+                else {}
+            )
+            queryset = common.filters.order_by_parameter(
+                queryset, model_class, ordering
+            )
 
         return queryset
 
@@ -780,7 +810,7 @@ class APISearchView(GenericAPIView):
             'supplierpart': company.api.SupplierPartList,
             'part': part.api.PartList,
             'partcategory': part.api.CategoryList,
-            'purchaseorder': order.api.PurchaseOrderList,
+            'purchaseorder': order.api.PurchaseOrderViewSet,
             'returnorder': order.api.ReturnOrderList,
             'salesorder': order.api.SalesOrderList,
             'salesordershipment': order.api.SalesOrderShipmentList,
@@ -844,7 +874,10 @@ class APISearchView(GenericAPIView):
                 if type(params) is not dict:
                     continue
 
-                view = cls()
+                is_viewset = issubclass(cls, viewsets.GenericViewSet) or issubclass(
+                    cls, viewsets.ViewSetMixin
+                )
+                view = cls if is_viewset else cls()
 
                 # Override regular query params with specific ones for this search request
                 cloned_request._request.GET = params
@@ -863,7 +896,25 @@ class APISearchView(GenericAPIView):
                     continue
 
                 try:
-                    results[key] = view.list(request, *args, **kwargs).data
+                    if is_viewset:
+                        # use dummy request to call the list method of the viewset
+                        req = HttpRequest()
+                        req.method = 'GET'
+                        req.user = request.user
+                        req.GET = params
+
+                        # Copy META from the original request, so that host/scheme
+                        # information is available (e.g. for pagination links).
+                        # Strip content-length/type, as this is a synthetic GET
+                        # request with no body of its own to parse.
+                        req.META = request.META.copy()
+                        req.META.pop('CONTENT_LENGTH', None)
+                        req.META.pop('CONTENT_TYPE', None)
+
+                        list_method = cls.as_view({'get': 'list'})(req, *args, **kwargs)
+                    else:
+                        list_method = view.list(request, *args, **kwargs)
+                    results[key] = list_method.data
                 except Exception as exc:
                     results[key] = {'error': str(exc)}
 
@@ -876,6 +927,9 @@ class GenericMetadataView(RetrieveUpdateAPI):
     model = None  # Placeholder for the model class
     serializer_class = MetadataSerializer
     permission_classes = [InvenTree.permissions.ContentTypePermission]
+
+    # Enforce limited range of lookup fields to prevent arbitrary queryset filtering
+    ALLOWED_LOOKUP_FIELDS = {'pk', 'key'}
 
     def get_permission_model(self):
         """Return the 'permission' model associated with this view."""
@@ -921,6 +975,17 @@ class GenericMetadataView(RetrieveUpdateAPI):
         )
         return super().dispatch(request, *args, **kwargs)
 
+    def initial(self, request, *args, **kwargs):
+        """Validate the lookup field before any queryset is touched.
+
+        This runs inside APIView's own exception handling (unlike dispatch(),
+        which runs before it), and *before* permission checks - so an invalid
+        lookup field is rejected without ever executing a query.
+        """
+        if self.lookup_field not in self.ALLOWED_LOOKUP_FIELDS:
+            raise ValidationError(f"Invalid lookup field '{self.lookup_field}'")
+        return super().initial(request, *args, **kwargs)
+
 
 class SimpleGenericMetadataView(GenericMetadataView):
     """Simplified version of GenericMetadataView which always uses 'pk' as the lookup field."""
@@ -963,6 +1028,52 @@ class MetadataRedirectView(RedirectView):
             'lookup_field': self.lookup_field,
         }
         return reverse('api-generic-metadata', args=args, kwargs=_kwargs)
+
+
+class HttpResponsePermanentRedirectPreserveMethod(HttpResponsePermanentRedirect):
+    """Permanent redirect which preserves the request method and body (HTTP 308).
+
+    Unlike a 301 redirect, clients must not change a POST / PUT / PATCH / DELETE
+    request into a GET request when following a 308 redirect.
+    """
+
+    status_code = 308
+
+
+@method_decorator(csrf_exempt, name='dispatch')
+class MovedEndpointRedirectView(RedirectView):
+    """Redirect requests for an API endpoint which has moved to a new URL.
+
+    - The redirect target is resolved from the named URL pattern of the new endpoint
+    - The request method and body are preserved (HTTP 308), so that write operations
+      against the old endpoint continue to work
+    - Any query parameters are passed through to the new endpoint
+
+    CSRF protection is not applied here, as this view does not perform any action itself.
+    The target endpoint applies the usual authentication, permission and CSRF checks.
+    """
+
+    query_string = True
+
+    def get(self, request, *args, **kwargs):
+        """Return a method-preserving redirect to the new endpoint."""
+        url = self.get_redirect_url(*args, **kwargs)
+        return HttpResponsePermanentRedirectPreserveMethod(url)
+
+    # All request methods are redirected in the same way
+    post = put = patch = delete = options = head = get
+
+
+def moved_path(route: str, pattern_name: str):
+    """Construct a path which redirects from a legacy API endpoint to its new location.
+
+    Arguments:
+        route: The legacy URL route (relative to the including URL pattern)
+        pattern_name: The name of the URL pattern for the new endpoint
+
+    Note: Any URL kwargs captured by the legacy route are passed to the new URL pattern.
+    """
+    return path(route, MovedEndpointRedirectView.as_view(pattern_name=pattern_name))
 
 
 def meta_path(model, lookup_field: str = 'pk', lookup_field_ref: str = 'pk'):

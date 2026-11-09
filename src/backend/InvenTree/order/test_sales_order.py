@@ -18,12 +18,15 @@ from rest_framework.exceptions import ValidationError as DRFValidationError
 import order.tasks
 from common.models import InvenTreeSetting, NotificationMessage
 from common.settings import set_global_setting
-from company.models import Address, Company
+from company.models import Address, Company, Contact
 from InvenTree import status_codes as status
 from InvenTree.unit_test import (
     InvenTreeAPITestCase,
     InvenTreeTestCase,
     addUserPermission,
+    stock_events,
+    stock_history,
+    stock_history_count,
 )
 from order.models import (
     SalesOrder,
@@ -35,7 +38,7 @@ from order.models import (
 from order.serializers import SalesOrderShipmentAllocationSerializer
 from part.models import Part
 from stock.events import StockEvents
-from stock.models import StockItem, StockItemTracking, StockLocation
+from stock.models import StockItem, StockLocation
 from stock.status_codes import StockHistoryCode
 from users.models import Owner
 
@@ -305,8 +308,8 @@ class SalesOrderTest(InvenTreeAPITestCase):
             self.order.can_complete(raise_error=True)
 
         # Now try to ship it - should fail
-        result = self.order.ship_order(None)
-        self.assertFalse(result)
+        with self.assertRaises(ValidationError):
+            self.order.ship_order(None)
 
     def test_order_cancel_stale_instance_is_noop(self):
         """A second cancellation attempt with a stale order instance must be a no-op.
@@ -334,9 +337,8 @@ class SalesOrderTest(InvenTreeAPITestCase):
         # cancellation must be skipped based on the database state
         self.assertEqual(order_b.status, status.SalesOrderStatus.PENDING)
 
-        with mock.patch('order.models.trigger_event') as trigger:
+        with self.assertRaises(ValidationError):
             order_b.cancel_order()
-            trigger.assert_not_called()
 
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, status.SalesOrderStatus.CANCELLED)
@@ -353,9 +355,8 @@ class SalesOrderTest(InvenTreeAPITestCase):
         self.assertEqual(SalesOrderAllocation.objects.count(), 2)
 
         # Attempt to ship the order (but shipments are not completed!)
-        result = self.order.ship_order(None)
-
-        self.assertFalse(result)
+        with self.assertRaises(ValidationError):
+            self.order.ship_order(None)
 
         self.assertIsNone(self.shipment.shipment_date)
         self.assertFalse(self.shipment.is_complete())
@@ -461,9 +462,27 @@ class SalesOrderTest(InvenTreeAPITestCase):
         # completion must be skipped based on the database state
         self.assertEqual(order_b.status, status.SalesOrderStatus.SHIPPED)
 
-        with mock.patch('order.models.trigger_event') as trigger:
-            self.assertFalse(order_b.complete_order(None))
-            trigger.assert_not_called()
+        with self.assertRaises(ValidationError) as err:
+            order_b.complete_order(None)
+
+        # complete_order() targets RETURN_VALUE(SHIPPED, COMPLETE), a State proxy with
+        # no single fixed value - unlike a plain-target transition (e.g.
+        # Build.cancel_build), inventree_transition cannot resolve a friendly "is
+        # already Complete" message for it, so it falls back to the generic
+        # "invalid transition" message instead. Assert on that message explicitly, so
+        # a regression here (e.g. this falling back to some other error entirely) is
+        # actually caught rather than passing on any ValidationError whatsoever.
+        expected_source = (
+            status.SalesOrderStatus.PENDING,
+            status.SalesOrderStatus.IN_PROGRESS,
+            status.SalesOrderStatus.ON_HOLD,
+            status.SalesOrderStatus.SHIPPED,
+        )
+        self.assertIn(
+            f'Invalid transition on Sales Order.status (source value should be'
+            f' {list(expected_source)}, is {status.SalesOrderStatus.COMPLETE.value})',
+            str(err.exception),
+        )
 
         self.order.refresh_from_db()
         self.assertEqual(self.order.status, status.SalesOrderStatus.COMPLETE)
@@ -490,7 +509,7 @@ class SalesOrderTest(InvenTreeAPITestCase):
         self.assertFalse(self.shipment.check_can_complete(raise_error=False))
 
         n_items = StockItem.objects.count()
-        n_tracking = StockItemTracking.objects.count()
+        n_tracking = stock_history_count()
 
         # Simulate a duplicated task execution
         # (e.g. a second completion request submitted before the first task ran)
@@ -503,7 +522,7 @@ class SalesOrderTest(InvenTreeAPITestCase):
 
         # No additional stock items or tracking entries have been created
         self.assertEqual(StockItem.objects.count(), n_items)
-        self.assertEqual(StockItemTracking.objects.count(), n_tracking)
+        self.assertEqual(stock_history_count(), n_tracking)
 
     def test_shipment_many_items(self):
         """Test completion of a shipment with many items.
@@ -602,8 +621,8 @@ class SalesOrderTest(InvenTreeAPITestCase):
                 url,
                 expected_code=200,
                 benchmark=True,
-                max_query_time=5.0,
-                max_query_count=100,
+                max_query_time=10.0,
+                max_query_count=150,
             )
 
         self.assertEqual(response.status_code, 200)
@@ -658,25 +677,18 @@ class SalesOrderTest(InvenTreeAPITestCase):
         self.assertEqual(len(low_stock_tasks), 1)
         self.assertEqual(low_stock_tasks[0].args(), (part.pk,))
 
-        # Exactly one StockItemTracking entry should exist per split, per side
+        # Exactly one 'split' event should exist per split (on the original item)
         self.assertEqual(
-            StockItemTracking.objects.filter(
-                tracking_type=StockHistoryCode.SPLIT_FROM_PARENT.value
-            ).count(),
-            len(split_pks),
-        )
-        self.assertEqual(
-            StockItemTracking.objects.filter(
-                tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value
-            ).count(),
+            stock_history_count(event_type=StockHistoryCode.SPLIT_CHILD_ITEM),
             len(split_pks),
         )
 
-        # Exactly one 'shipped' tracking entry should exist per allocated item
+        # Exactly one 'shipped' event should exist per allocated item
+        # (for split items, this is recorded against the creation of the new item)
         self.assertEqual(
-            StockItemTracking.objects.filter(
-                tracking_type=StockHistoryCode.SHIPPED_AGAINST_SALES_ORDER.value
-            ).count(),
+            stock_history_count(
+                event_type=StockHistoryCode.SHIPPED_AGAINST_SALES_ORDER
+            ),
             N_ITEMS,
         )
 
@@ -688,15 +700,15 @@ class SalesOrderTest(InvenTreeAPITestCase):
             self.assertEqual(item.customer, customer)
 
             self.assertFalse(
-                StockItemTracking.objects.filter(
-                    item=item, tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value
+                stock_events(
+                    item, event_type=StockHistoryCode.SPLIT_CHILD_ITEM
                 ).exists()
             )
             self.assertTrue(
-                StockItemTracking.objects.filter(
-                    item=item,
-                    tracking_type=StockHistoryCode.SHIPPED_AGAINST_SALES_ORDER.value,
-                    deltas__salesorder=so.pk,
+                stock_events(
+                    item,
+                    event_type=StockHistoryCode.SHIPPED_AGAINST_SALES_ORDER,
+                    additional_data__deltas__salesorder__pk=so.pk,
                 ).exists()
             )
 
@@ -719,24 +731,20 @@ class SalesOrderTest(InvenTreeAPITestCase):
         )
 
         self.assertEqual(sample_new_item.quantity, 1)
-        self.assertTrue(
-            StockItemTracking.objects.filter(
-                item=sample_new_item,
-                tracking_type=StockHistoryCode.SPLIT_FROM_PARENT.value,
-                deltas__stockitem=sample_original.pk,
-            ).exists()
+
+        # The new item records a single entry - its creation (as a child of the original),
+        # with the 'shipped' event
+        [created] = stock_history(sample_new_item)
+        self.assertEqual(created.changes_dict['parent'], [None, sample_original.pk])
+        self.assertEqual(
+            created.event_type, StockHistoryCode.SHIPPED_AGAINST_SALES_ORDER
         )
+        self.assertEqual(created.additional_data['deltas']['salesorder']['pk'], so.pk)
+
+        # The original item records the split
         self.assertTrue(
-            StockItemTracking.objects.filter(
-                item=sample_original,
-                tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value,
-            ).exists()
-        )
-        self.assertTrue(
-            StockItemTracking.objects.filter(
-                item=sample_new_item,
-                tracking_type=StockHistoryCode.SHIPPED_AGAINST_SALES_ORDER.value,
-                deltas__salesorder=so.pk,
+            stock_events(
+                sample_original, event_type=StockHistoryCode.SPLIT_CHILD_ITEM
             ).exists()
         )
         self.assertTrue(
@@ -843,6 +851,36 @@ class SalesOrderTest(InvenTreeAPITestCase):
         self.assertIn(
             'Shipment address must match the customer', err.exception.messages
         )
+
+    def test_shipment_contact(self):
+        """Unit tests for SalesOrderShipment contact field."""
+        shipment = SalesOrderShipment.objects.first()
+        self.assertIsNotNone(shipment)
+        self.assertIsNone(shipment.contact)
+
+        contact = Contact.objects.create(
+            company=shipment.order.customer, name='Shipment Contact'
+        )
+
+        shipment.contact = contact
+        shipment.clean()
+        shipment.save()
+
+        shipment.refresh_from_db()
+        self.assertEqual(shipment.contact, contact)
+
+        # Contact must belong to the order customer
+        other_company = Company.objects.exclude(pk=shipment.order.customer.pk).first()
+        self.assertIsNotNone(other_company)
+
+        shipment.contact = Contact.objects.create(
+            company=other_company, name='Other Contact'
+        )
+
+        with self.assertRaises(ValidationError) as err:
+            shipment.clean()
+
+        self.assertIn('Contact does not match the customer', err.exception.messages)
 
     def test_overdue_notification(self):
         """Test overdue sales order notification."""

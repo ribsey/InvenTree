@@ -4,15 +4,60 @@ from typing import Any
 
 from django.contrib.auth.models import Group, Permission
 from django.contrib.contenttypes.models import ContentType
+from django.utils.translation import gettext_lazy as _
 
 import structlog
 
+import common.notifications
+import InvenTree.helpers
+from InvenTree.helpers_model import construct_absolute_url
 from InvenTree.ready import canAppAccessDatabase
-from users.models import RuleSet
+from users.models import ApiToken, RuleSet, check_email_warning
 from users.permissions import get_model_permission_string, split_permission
 from users.ruleset import RULESET_CHANGE_INHERIT, RULESET_CHOICES, RULESET_NAMES
 
 logger = structlog.get_logger('inventree')
+
+
+def notify_api_token(token: ApiToken):
+    """Send warning that a token has been issued."""
+    user = token.user
+    issuer = token.issued_by
+
+    if issuer and issuer != user:
+        message = _(
+            "A new API token '{name}' was issued for your account by {issuer}"
+        ).format(name=token.name, issuer=issuer.username)
+    else:
+        message = _("A new API token '{name}' was issued for your account").format(
+            name=token.name
+        )
+
+    name = _('API Token Issued')
+    context = {
+        'name': name,
+        'message': message,
+        'token': token,
+        'link': construct_absolute_url(
+            InvenTree.helpers.pui_url('settings/user/security')
+        ),
+        'template': {'html': 'email/api_token_issued.html', 'subject': name},
+    }
+
+    if check_email_warning():
+        logger.warning(
+            "INVE-W7: API token '%s' issued for user '%s' - but email not set up",
+            token.name,
+            user.username,
+        )
+    common.notifications.trigger_notification(
+        None,
+        'users.api_token_issued',
+        targets=[user],
+        context=context,
+        check_recent=False,
+        notification_uid=f'api_token_{token.pk}',
+    )
 
 
 def rebuild_all_permissions() -> None:
@@ -88,7 +133,7 @@ def update_group_roles(group: Group, debug: bool = False) -> None:
         if action not in ['view', 'add', 'change', 'delete']:  # pragma: no cover
             raise ValueError(f'Action {action} is invalid')
 
-        permission_string = get_model_permission_string(model, action)
+        permission_string = get_model_permission_string(name, action)
 
         if allowed:
             # An 'allowed' action is always preferenced over a 'forbidden' action
@@ -124,6 +169,16 @@ def update_group_roles(group: Group, debug: bool = False) -> None:
             add_model(model, 'add', ruleset.can_add)
             add_model(model, 'change', ruleset.can_change)
             add_model(model, 'delete', ruleset.can_delete)
+
+    # Enable action permissions for certain children models,
+    # if the parent model has the same action permission.
+    # Note: This must be determined from the *desired* permissions (rather than
+    # the permissions currently assigned to the group), and before any permissions are
+    # added or removed - otherwise inherited permissions are dropped on alternate updates.
+    for parent, child in RULESET_CHANGE_INHERIT:
+        for action in ['view', 'change', 'add', 'delete']:
+            if f'{parent}.{action}_{parent}' in permissions_to_add:
+                add_model(f'{parent}_{child}', action, True)
 
     def get_permission_object(permission_string):
         """Find the permission object in the database, from the simplified permission string.
@@ -171,27 +226,3 @@ def update_group_roles(group: Group, debug: bool = False) -> None:
             group.permissions.remove(permission)
             if debug:  # pragma: no cover
                 logger.debug('Removing permission %s from group %s', perm, group.name)
-
-    # Enable all action permissions for certain children models
-    # if parent model has 'change' permission
-    for parent, child in RULESET_CHANGE_INHERIT:
-        parent_child_string = f'{parent}_{child}'
-
-        # Check each type of permission
-        for action in ['view', 'change', 'add', 'delete']:
-            parent_perm = f'{parent}.{action}_{parent}'
-
-            if parent_perm in group_permissions:
-                child_perm = f'{parent}.{action}_{child}'
-
-                # Check if child permission not already in group
-                if child_perm not in group_permissions:
-                    # Create permission object
-                    add_model(parent_child_string, action, ruleset.can_delete)
-                    # Add to group
-                    permission = get_permission_object(child_perm)
-                    if permission:
-                        group.permissions.add(permission)
-                        logger.debug(
-                            'Adding permission %s to group %s', child_perm, group.name
-                        )

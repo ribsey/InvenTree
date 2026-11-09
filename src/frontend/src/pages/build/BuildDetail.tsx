@@ -38,6 +38,9 @@ import {
 import InstanceDetail from '../../components/nav/InstanceDetail';
 import { PageDetail } from '../../components/nav/PageDetail';
 import AttachmentPanel from '../../components/panels/AttachmentPanel';
+import HistoryPanel, {
+  useShowHistoryPanel
+} from '../../components/panels/HistoryPanel';
 import NotesPanel from '../../components/panels/NotesPanel';
 import { PanelGroup } from '../../components/panels/PanelGroup';
 import ParametersPanel from '../../components/panels/ParametersPanel';
@@ -49,6 +52,7 @@ import {
   useEditApiFormModal
 } from '../../hooks/UseForm';
 import { useInstance } from '../../hooks/UseInstance';
+import { useInstanceInfo } from '../../hooks/UseInstanceInfo';
 import useStatusCodes from '../../hooks/UseStatusCodes';
 import { useGlobalSettingsState } from '../../states/SettingsStates';
 import { useUserState } from '../../states/UserState';
@@ -231,6 +235,13 @@ export default function BuildDetail() {
     refetchOnMount: true
   });
 
+  const { instanceInfo } = useInstanceInfo({
+    modelType: ModelType.build,
+    modelId: build?.pk
+  });
+
+  const showHistory = useShowHistoryPanel();
+
   const buildPanels: PanelType[] = useMemo(() => {
     return [
       {
@@ -329,7 +340,7 @@ export default function BuildDetail() {
           <Skeleton />
         ),
         hidden:
-          !user.hasViewRole(UserRoles.purchase_order) ||
+          !user.hasViewVisible(UserRoles.purchase_order) ||
           !build.external ||
           !globalSettings.isSet('BUILDORDER_EXTERNAL_BUILDS')
       },
@@ -357,29 +368,38 @@ export default function BuildDetail() {
       },
       ParametersPanel({
         model_type: ModelType.build,
-        model_id: build.pk
+        model_id: build.pk,
+        parameter_count: instanceInfo.parameter_count
       }),
       AttachmentPanel({
         model_type: ModelType.build,
-        model_id: build.pk
+        model_id: build.pk,
+        attachment_count: instanceInfo.attachment_count
       }),
       NotesPanel({
         model_type: ModelType.build,
         model_id: build.pk,
-        has_note: !!build.notes
+        note_count: instanceInfo.note_count
+      }),
+      HistoryPanel({
+        model_type: ModelType.build,
+        model_id: build.pk,
+        visible: showHistory
       })
     ];
   }, [
     build,
     id,
     user,
+    instanceInfo,
 
     buildStatus,
     globalSettings,
     showChildBuilds,
     buildLineQuery.isFetching,
     buildLineQuery.isLoading,
-    buildLineData
+    buildLineData,
+    showHistory
   ]);
 
   const editBuildOrderFields = useBuildOrderFields({
@@ -393,7 +413,6 @@ export default function BuildDetail() {
     title: t`Edit Build Order`,
     modalId: 'edit-build-order',
     fields: editBuildOrderFields,
-    queryParams: new URLSearchParams({ tags: 'true' }),
     onFormSuccess: refreshInstance
   });
 
@@ -566,6 +585,7 @@ export default function BuildDetail() {
           />,
           <DetailsBadge
             label={t`External`}
+            tooltip={t`This build order is fulfilled by an external supplier`}
             color='blue'
             key='external'
             visible={build.external}
@@ -584,6 +604,8 @@ export default function BuildDetail() {
       <InstanceDetail query={instanceQuery} requiredRole={UserRoles.build}>
         <Stack gap='xs'>
           <PageDetail
+            model={ModelType.build}
+            id={build.pk}
             title={`${t`Build Order`}: ${build.reference}`}
             subtitle={`${build.quantity} x ${build.part_detail?.full_name}`}
             badges={buildBadges}

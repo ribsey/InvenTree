@@ -84,6 +84,18 @@ class InvenTreeNotificationBodies:
     )
 
 
+def get_user_language(user) -> str:
+    """Return the preferred language code for a user, or default system language."""
+    from django.conf import settings
+
+    if user and (profile := getattr(user, 'profile', None)):
+        if lang := getattr(profile, 'language', None):
+            return lang
+
+    # Fallback to system default language
+    return getattr(settings, 'LANGUAGE_CODE', 'en-us')
+
+
 def trigger_notification(obj: Model, category: str = '', obj_ref: str = 'pk', **kwargs):
     """Send out a notification.
 

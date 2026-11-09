@@ -22,7 +22,6 @@ from InvenTree.mixins import (
     RetrieveUpdateAPI,
     RetrieveUpdateDestroyAPI,
 )
-from users.permissions import check_user_permission
 
 
 class DataImporterPermissionMixin:
@@ -120,9 +119,8 @@ class DataImportSessionAcceptFields(APIView):
             raise PermissionDenied()
 
         # Check that the user has permission to accept the field mapping
-        if model_class := session.model_class:
-            if not check_user_permission(request.user, model_class, 'change'):
-                raise PermissionDenied()
+        if not session.check_import_permission(request.user):
+            raise PermissionDenied()
 
         # Attempt to accept the mapping (may raise an exception if the mapping is invalid)
         session.accept_mapping()
@@ -150,6 +148,8 @@ class DataImportSessionAcceptRows(DataImporterPermissionMixin, CreateAPI):
         if session:
             user = self.request.user
             if not user.is_staff and session.user != user:
+                raise PermissionDenied()
+            if not session.check_import_permission(user):
                 raise PermissionDenied()
             ctx['session'] = session
 
@@ -188,6 +188,10 @@ class DataImportColumnMappingList(DataImportSessionChildMixin, ListAPI):
     filter_backends = SEARCH_ORDER_FILTER
 
     filterset_fields = ['session']
+
+    ordering_fields = ['column_label', 'field_name', 'session']
+
+    search_fields = ['column_label', 'field_name']
 
 
 class DataImportColumnMappingDetail(DataImportSessionChildMixin, RetrieveUpdateAPI):

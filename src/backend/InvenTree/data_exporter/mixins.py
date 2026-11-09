@@ -18,7 +18,7 @@ import data_exporter.tasks
 import InvenTree.exceptions
 import InvenTree.serializers
 from common.models import DataOutput
-from InvenTree.helpers import str2bool
+from InvenTree.helpers import escape_export_value, str2bool
 from InvenTree.tasks import offload_task
 from plugin import PluginMixinEnum, registry
 
@@ -218,7 +218,9 @@ class DataExportSerializerMixin:
         dataset = tablib.Dataset(headers=field_headers)
 
         for row in data:
-            dataset.append([self.get_nested_value(row, f) for f in field_names])
+            dataset.append([
+                escape_export_value(self.get_nested_value(row, f)) for f in field_names
+            ])
 
         return dataset.export(file_format)
 
@@ -432,8 +434,8 @@ class DataExportViewMixin:
         # Update the output object with the exported data
         output.mark_complete(output=ContentFile(datafile, filename))
 
-    def get(self, request, *args, **kwargs):
-        """Override the GET method to determine export options."""
+    def list(self, request, *args, **kwargs):
+        """Override the list method to determine export options."""
         from common.serializers import DataOutputSerializer
 
         # If we are not exporting data, return the default response
@@ -504,4 +506,4 @@ class DataExportViewMixin:
             # Return a response to the frontend
             return Response(DataOutputSerializer(output).data, status=200)
 
-        return super().get(request, *args, **kwargs)
+        return super().list(request, *args, **kwargs)

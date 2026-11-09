@@ -19,6 +19,7 @@ import order.models
 import part.filters as part_filters
 import stock.models
 import stock.serializers
+from audit.helpers import write_batched
 from common.settings import get_global_setting
 from company.serializers import (
     AddressBriefSerializer,
@@ -40,8 +41,8 @@ from InvenTree.serializers import (
     InvenTreeModelSerializer,
     InvenTreeMoneySerializer,
     InvenTreeTaggitSerializer,
-    NotesFieldMixin,
     OptionalField,
+    apply_duplicate_copy_options,
 )
 from InvenTree.tasks import batch_offload_tasks
 from order.status_codes import (
@@ -53,7 +54,6 @@ from order.status_codes import (
 )
 from part.serializers import PartBriefSerializer
 from plugin.base.event.events import batch_events
-from stock.models import batch_tracking_entries
 from stock.status_codes import StockStatus
 from users.serializers import OwnerSerializer, UserSerializer
 
@@ -82,7 +82,6 @@ class AbstractOrderSerializer(
     """Abstract serializer class which provides fields common to all order types."""
 
     export_exclude_fields = ['notes']
-
     import_exclude_fields = ['notes']
 
     # Number of line items in this order
@@ -191,7 +190,7 @@ class AbstractOrderSerializer(
             custom_status = get_logical_value(
                 value, model=self.Meta.model._meta.model_name
             )
-        except:
+        except Exception:
             raise ValidationError(_('Invalid custom status key'))
 
         if custom_status.logical_key is not self.instance.status:
@@ -229,7 +228,6 @@ class AbstractOrderSerializer(
             'status',
             'status_text',
             'status_custom_key',
-            'notes',
             'barcode_hash',
             'overdue',
             'duplicate',
@@ -273,8 +271,9 @@ class AbstractOrderSerializer(
                     line.order = instance
                     line.save()
 
-            if duplicate.get('copy_parameters', False):
-                instance.copy_parameters_from(original)
+            apply_duplicate_copy_options(
+                instance, duplicate, original, copy_notes=False, copy_parameters=False
+            )
 
         return instance
 
@@ -382,7 +381,6 @@ class AbstractExtraLineMeta:
 
 @register_importer()
 class PurchaseOrderSerializer(
-    NotesFieldMixin,
     TotalPriceMixin,
     InvenTreeCustomStatusSerializerMixin,
     AbstractOrderSerializer,
@@ -403,6 +401,10 @@ class PurchaseOrderSerializer(
             'total_price',
             'order_currency',
             'destination',
+            'receiving_company',
+            'receiving_company_detail',
+            'delivery_address',
+            'delivery_address_detail',
             'updated_at',
         ])
         read_only_fields = [
@@ -422,11 +424,28 @@ class PurchaseOrderSerializer(
 
         return [*fields, 'duplicate']
 
+    def __init__(self, *args, **kwargs):
+        """Set a dynamic default for the 'destination' field, on creation only."""
+        super().__init__(*args, **kwargs)
+
+        if self.instance is None:
+            location_pk = get_global_setting(
+                'PURCHASEORDER_DEFAULT_RECEIVE_LOCATION', backup_value=None
+            )
+
+            if location_pk:
+                self.fields[
+                    'destination'
+                ].default = stock.models.StockLocation.objects.filter(
+                    pk=location_pk
+                ).first()
+
     duplicate = DuplicateOptionsSerializer(
         order.models.PurchaseOrder.objects.all(),
         copy_lines=True,
         copy_extra_lines=True,
         copy_parameters=True,
+        copy_notes=True,
     )
 
     @staticmethod
@@ -473,6 +492,29 @@ class PurchaseOrderSerializer(
         prefetch_fields=['supplier'],
     )
 
+    receiving_company_detail = OptionalField(
+        serializer_class=CompanyBriefSerializer,
+        serializer_kwargs={
+            'source': 'receiving_company',
+            'many': False,
+            'read_only': True,
+            'allow_null': True,
+        },
+        prefetch_fields=['receiving_company'],
+    )
+
+    delivery_address_detail = OptionalField(
+        serializer_class=AddressBriefSerializer,
+        serializer_kwargs={
+            'source': 'delivery_address',
+            'many': False,
+            'read_only': True,
+            'allow_null': True,
+        },
+        default_include=True,
+        prefetch_fields=['delivery_address'],
+    )
+
 
 class OrderAdjustSerializer(serializers.Serializer):
     """Generic serializer class for adjusting the status of an order."""
@@ -492,25 +534,6 @@ class OrderAdjustSerializer(serializers.Serializer):
         Note: It is passed in via the serializer context data.
         """
         return self.context['order']
-
-
-class PurchaseOrderHoldSerializer(OrderAdjustSerializer):
-    """Serializer for placing a PurchaseOrder on hold."""
-
-    def save(self):
-        """Save the serializer to 'hold' the order."""
-        self.order.hold_order()
-
-
-class PurchaseOrderCancelSerializer(OrderAdjustSerializer):
-    """Serializer for cancelling a PurchaseOrder."""
-
-    def save(self):
-        """Save the serializer to 'cancel' the order."""
-        if not self.order.can_cancel:
-            raise ValidationError(_('Order cannot be cancelled'))
-
-        self.order.cancel_order()
 
 
 class PurchaseOrderCompleteSerializer(OrderAdjustSerializer):
@@ -542,18 +565,6 @@ class PurchaseOrderCompleteSerializer(OrderAdjustSerializer):
         order = self.context['order']
 
         return {'is_complete': order.is_complete}
-
-    def save(self):
-        """Save the serializer to 'complete' the order."""
-        self.order.complete_order()
-
-
-class PurchaseOrderIssueSerializer(OrderAdjustSerializer):
-    """Serializer for issuing (sending) a purchase order."""
-
-    def save(self):
-        """Save the serializer to 'place' the order."""
-        self.order.place_order()
 
 
 @register_importer()
@@ -880,6 +891,7 @@ class PurchaseOrderLineItemReceiveSerializer(serializers.Serializer):
         return quantity
 
     batch_code = serializers.CharField(
+        max_length=stock.models.StockItem._meta.get_field('batch').max_length,
         label=_('Batch Code'),
         help_text=_('Enter batch code for incoming stock items'),
         required=False,
@@ -906,6 +918,7 @@ class PurchaseOrderLineItemReceiveSerializer(serializers.Serializer):
     status = stock.serializers.StockStatusCustomSerializer(default=StockStatus.OK.value)
 
     packaging = serializers.CharField(
+        max_length=stock.models.StockItem._meta.get_field('packaging').max_length,
         label=_('Packaging'),
         help_text=_('Override packaging information for incoming stock items'),
         required=False,
@@ -914,6 +927,7 @@ class PurchaseOrderLineItemReceiveSerializer(serializers.Serializer):
     )
 
     note = serializers.CharField(
+        max_length=stock.models.StockItem.TRACKING_NOTES_MAX_LENGTH,
         label=_('Note'),
         help_text=_('Additional note for incoming stock items'),
         required=False,
@@ -922,6 +936,7 @@ class PurchaseOrderLineItemReceiveSerializer(serializers.Serializer):
     )
 
     barcode = serializers.CharField(
+        max_length=stock.models.StockItem._meta.get_field('barcode_data').max_length,
         label=_('Barcode'),
         help_text=_('Scanned barcode'),
         default='',
@@ -995,7 +1010,7 @@ class PurchaseOrderReceiveSerializer(serializers.Serializer):
     class Meta:
         """Metaclass options."""
 
-        fields = ['items', 'location']
+        fields = ['items', 'location', 'batch_code']
 
     items = PurchaseOrderLineItemReceiveSerializer(many=True)
 
@@ -1006,6 +1021,17 @@ class PurchaseOrderReceiveSerializer(serializers.Serializer):
         allow_null=True,
         label=_('Location'),
         help_text=_('Select destination location for received items'),
+    )
+
+    batch_code = serializers.CharField(
+        max_length=stock.models.StockItem._meta.get_field('batch').max_length,
+        label=_('Batch Code'),
+        help_text=_(
+            'Enter batch code for incoming stock items - applied to any line item which does not specify its own batch code'
+        ),
+        required=False,
+        default='',
+        allow_blank=True,
     )
 
     def validate(self, data):
@@ -1020,6 +1046,7 @@ class PurchaseOrderReceiveSerializer(serializers.Serializer):
         items = data.get('items', [])
 
         location = data.get('location', order.destination)
+        batch_code = data.get('batch_code', '')
 
         if len(items) == 0:
             raise ValidationError(_('Line items must be provided'))
@@ -1050,6 +1077,10 @@ class PurchaseOrderReceiveSerializer(serializers.Serializer):
                 raise ValidationError({
                     'location': _('Destination location must be specified')
                 })
+
+            # If no batch code is specified for this line item, fall back to the top-level value
+            if not item.get('batch_code'):
+                item['batch_code'] = batch_code
 
             barcode = item.get('barcode', '')
 
@@ -1096,7 +1127,7 @@ class PurchaseOrderReceiveSerializer(serializers.Serializer):
             with (
                 transaction.atomic(),
                 batch_events(),
-                batch_tracking_entries(),
+                write_batched(),
                 batch_offload_tasks(),
             ):
                 items = order.receive_line_items(
@@ -1112,7 +1143,6 @@ class PurchaseOrderReceiveSerializer(serializers.Serializer):
 
 @register_importer()
 class SalesOrderSerializer(
-    NotesFieldMixin,
     TotalPriceMixin,
     InvenTreeCustomStatusSerializerMixin,
     AbstractOrderSerializer,
@@ -1152,6 +1182,7 @@ class SalesOrderSerializer(
         copy_lines=True,
         copy_extra_lines=True,
         copy_parameters=True,
+        copy_notes=True,
     )
 
     @staticmethod
@@ -1427,7 +1458,6 @@ class SalesOrderShipmentSerializer(
     DataImportExportSerializerMixin,
     FilterableSerializerMixin,
     InvenTreeTaggitSerializer,
-    NotesFieldMixin,
     InvenTreeModelSerializer,
 ):
     """Serializer for the SalesOrderShipment class."""
@@ -1444,6 +1474,7 @@ class SalesOrderShipmentSerializer(
             'allocated_items',
             'shipment_date',
             'shipment_address',
+            'contact',
             'delivery_date',
             'checked_by',
             'duplicate',
@@ -1452,10 +1483,10 @@ class SalesOrderShipmentSerializer(
             'invoice_number',
             'barcode_hash',
             'link',
-            'notes',
             # Extra detail fields
             'parameters',
             'checked_by_detail',
+            'contact_detail',
             'customer_detail',
             'order_detail',
             'shipment_address_detail',
@@ -1527,12 +1558,26 @@ class SalesOrderShipmentSerializer(
         prefetch_fields=['shipment_address'],
     )
 
+    contact_detail = OptionalField(
+        serializer_class=ContactSerializer,
+        serializer_kwargs={
+            'source': 'contact',
+            'many': False,
+            'read_only': True,
+            'allow_null': True,
+        },
+        default_include=True,
+        prefetch_fields=['contact'],
+    )
+
     parameters = common.filters.enable_parameters_filter()
 
     tags = common.filters.enable_tags_filter()
 
     duplicate = DuplicateOptionsSerializer(
-        order.models.SalesOrderShipment.objects.all(), copy_parameters=True
+        order.models.SalesOrderShipment.objects.all(),
+        copy_parameters=True,
+        copy_notes=True,
     )
 
     @transaction.atomic
@@ -1543,10 +1588,13 @@ class SalesOrderShipmentSerializer(
         instance = super().create(validated_data)
 
         if duplicate:
-            original = duplicate['original']
-
-            if duplicate.get('copy_parameters', True):
-                instance.copy_parameters_from(original)
+            apply_duplicate_copy_options(
+                instance,
+                duplicate,
+                duplicate['original'],
+                copy_notes=True,
+                copy_parameters=True,
+            )
 
         return instance
 
@@ -1582,7 +1630,7 @@ class SalesOrderAllocationSerializer(
             'location_detail',
             'shipment_detail',
         ]
-        read_only_fields = ['line', '']
+        read_only_fields = ['line']
 
     part = serializers.PrimaryKeyRelatedField(source='item.part', read_only=True)
     order = serializers.PrimaryKeyRelatedField(
@@ -2141,7 +2189,6 @@ class SalesOrderExtraLineSerializer(
 
 @register_importer()
 class ReturnOrderSerializer(
-    NotesFieldMixin,
     InvenTreeCustomStatusSerializerMixin,
     AbstractOrderSerializer,
     TotalPriceMixin,
@@ -2176,6 +2223,7 @@ class ReturnOrderSerializer(
         order.models.ReturnOrder.objects.all(),
         copy_extra_lines=True,
         copy_parameters=True,
+        copy_notes=True,
     )
 
     @staticmethod
@@ -2296,6 +2344,7 @@ class ReturnOrderReceiveSerializer(serializers.Serializer):
     )
 
     note = serializers.CharField(
+        max_length=stock.models.StockItem.TRACKING_NOTES_MAX_LENGTH,
         label=_('Note'),
         help_text=_('Additional note for incoming stock items'),
         required=False,
@@ -2438,7 +2487,6 @@ class ReturnOrderExtraLineSerializer(
 
 @register_importer()
 class TransferOrderSerializer(
-    NotesFieldMixin,
     InvenTreeCustomStatusSerializerMixin,
     AbstractOrderSerializer,
     InvenTreeModelSerializer,
@@ -2468,7 +2516,10 @@ class TransferOrderSerializer(
 
     # Note: TransferOrder does not have "extra" line items
     duplicate = DuplicateOptionsSerializer(
-        order.models.TransferOrder.objects.all(), copy_lines=True, copy_parameters=True
+        order.models.TransferOrder.objects.all(),
+        copy_lines=True,
+        copy_parameters=True,
+        copy_notes=True,
     )
 
     @staticmethod
@@ -2887,7 +2938,7 @@ class TransferOrderAllocationSerializer(
             'order_detail',
             'location_detail',
         ]
-        read_only_fields = ['line', '']
+        read_only_fields = ['line']
 
     part = serializers.PrimaryKeyRelatedField(source='item.part', read_only=True)
     order = serializers.PrimaryKeyRelatedField(

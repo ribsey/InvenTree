@@ -1,5 +1,8 @@
 """Unit tests for the 'users' app."""
 
+import datetime
+from unittest import mock
+
 from django.apps import apps
 from django.contrib.auth.models import Group
 from django.test import TestCase
@@ -8,7 +11,7 @@ from django.urls import reverse
 from common.settings import set_global_setting
 from InvenTree.helpers_mfa import get_codes
 from InvenTree.unit_test import AdminTestCase, InvenTreeAPITestCase, InvenTreeTestCase
-from users.models import ApiToken, Owner
+from users.models import ApiToken, Owner, TipResult
 from users.oauth2_scopes import _roles
 from users.ruleset import (
     RULESET_CHOICES,
@@ -16,6 +19,7 @@ from users.ruleset import (
     get_ruleset_ignore,
     get_ruleset_models,
 )
+from web.tips import KNOWN_IDS
 
 G_RULESETS = get_ruleset_models()
 G_RULESETS_IG = get_ruleset_ignore()
@@ -192,6 +196,51 @@ class RuleSetModelTest(TestCase):
         # There should now not be any permissions assigned to this group
         self.assertEqual(group.permissions.count(), 0)
 
+    def test_permission_inherit_stable(self):
+        """Inherited child permissions must survive repeated group updates.
+
+        The 'part' role grants permissions against 'part_bomitem' via RULESET_CHANGE_INHERIT,
+        even though 'part_bomitem' is not covered by the 'part' role directly.
+        These inherited permissions must not be dropped (or toggled) on subsequent updates.
+        """
+        group = Group.objects.create(name='Inherit group')
+
+        part_rule = group.rule_sets.get(name='part')
+        part_rule.can_add = True
+        part_rule.can_delete = True
+        part_rule.save()
+
+        expected = {
+            f'part.{action}_bomitem' for action in ['view', 'add', 'change', 'delete']
+        }
+
+        for _ in range(4):
+            group.save()
+
+            permissions = {
+                f'{p.content_type.app_label}.{p.codename}'
+                for p in group.permissions.all().prefetch_related('content_type')
+            }
+
+            self.assertTrue(expected.issubset(permissions))
+
+        # Removing the parent permissions also removes the inherited permissions
+        part_rule.can_view = False
+        part_rule.can_add = False
+        part_rule.can_change = False
+        part_rule.can_delete = False
+        part_rule.save()
+
+        for _ in range(2):
+            group.save()
+
+            permissions = {
+                f'{p.content_type.app_label}.{p.codename}'
+                for p in group.permissions.all().prefetch_related('content_type')
+            }
+
+            self.assertTrue(expected.isdisjoint(permissions))
+
 
 class OwnerModelTest(InvenTreeTestCase):
     """Some simplistic tests to ensure the Owner model is setup correctly."""
@@ -298,7 +347,10 @@ class OwnerModelTest(InvenTreeTestCase):
         self.client.login(username=self.username, password=self.password)
         # token get
         response = self.do_request(reverse('api-token'), {})
-        self.assertEqual(response['token'], token.first().key)
+        raw_token = response['token']
+        self.assertTrue(raw_token.startswith('inv-2-'))
+        token = ApiToken.get_from_string(raw_token)
+        self.assertTrue(token.validate(raw_token))
 
         # test user is associated with token
         response = self.do_request(
@@ -404,8 +456,154 @@ class AdminTest(AdminTestCase):
         my_token = self.helper(
             model=ApiToken, model_kwargs={'user': self.user, 'name': 'test-token'}
         )
+        self.assertTrue(
+            my_token.token.endswith(
+                f'-{datetime.datetime.now().date().isoformat().replace("-", "")}'
+            )
+        )
+        self.assertTrue(my_token.validate(my_token.token))
         # Additionally test str fnc
         self.assertEqual(str(my_token), my_token.token)
+
+    def test_owner_admin_search(self):
+        """Test search functionality in OwnerAdmin."""
+        from django.contrib.admin.sites import site
+        from django.contrib.auth import get_user_model
+        from django.test import RequestFactory
+
+        from users.admin import OwnerAdmin
+
+        owner_admin = OwnerAdmin(Owner, site)
+        request = RequestFactory().get('/admin/')
+        request.user = self.user
+
+        # Create distinct user and group
+        test_user = get_user_model().objects.create_user(
+            username='searchable_user',
+            first_name='Searchy',
+            last_name='Tester',
+            email='searchy@example.com',
+            password='password',
+        )
+        test_group = Group.objects.create(name='SearchableGroup')
+
+        user_owner = Owner.get_owner(test_user)
+        group_owner = Owner.get_owner(test_group)
+
+        # Empty search returns full queryset
+        qs, use_distinct = owner_admin.get_search_results(
+            request, Owner.objects.all(), ''
+        )
+        self.assertFalse(use_distinct)
+        self.assertIn(user_owner, qs)
+        self.assertIn(group_owner, qs)
+
+        # Search by username
+        qs, use_distinct = owner_admin.get_search_results(
+            request, Owner.objects.all(), 'searchable_user'
+        )
+        self.assertTrue(use_distinct)
+        self.assertIn(user_owner, qs)
+        self.assertNotIn(group_owner, qs)
+
+        # Search by first name
+        qs, _ = owner_admin.get_search_results(request, Owner.objects.all(), 'Searchy')
+        self.assertIn(user_owner, qs)
+        self.assertNotIn(group_owner, qs)
+
+        # Search by last name
+        qs, _ = owner_admin.get_search_results(request, Owner.objects.all(), 'Tester')
+        self.assertIn(user_owner, qs)
+        self.assertNotIn(group_owner, qs)
+
+        # Search by email
+        qs, _ = owner_admin.get_search_results(
+            request, Owner.objects.all(), 'searchy@example.com'
+        )
+        self.assertIn(user_owner, qs)
+        self.assertNotIn(group_owner, qs)
+
+        # Search by group name
+        qs, _ = owner_admin.get_search_results(
+            request, Owner.objects.all(), 'SearchableGroup'
+        )
+        self.assertIn(group_owner, qs)
+        self.assertNotIn(user_owner, qs)
+
+        # Search non-existent term
+        qs, _ = owner_admin.get_search_results(
+            request, Owner.objects.all(), 'nonexistentxyzterm'
+        )
+        self.assertEqual(qs.count(), 0)
+
+    def test_usersession_admin_delete(self):
+        """Deleting a UserSession via the admin must log the user out."""
+        from django.contrib.auth import get_user_model
+        from django.contrib.sessions.models import Session
+
+        from allauth.usersessions.models import UserSession
+        from rest_framework.test import APIClient
+
+        victim = get_user_model().objects.create_user(
+            username='victim', password='password'
+        )
+        me_url = reverse('api-user-me')
+
+        def login_victim():
+            """Log in as the victim user and return the client and its UserSession."""
+            client = APIClient()
+            client.login(username='victim', password='password')
+            self.assertEqual(client.get(me_url).status_code, 200)
+            # client.login() bypasses the allauth signal which tracks the session
+            session = UserSession.objects.create(
+                user=victim, session_key=client.session.session_key, ip='127.0.0.1'
+            )
+            return client, session
+
+        def check_logged_out(client, session):
+            """Check the victim session has been ended."""
+            self.assertFalse(UserSession.objects.filter(pk=session.pk).exists())
+            self.assertFalse(Session.objects.filter(pk=session.session_key).exists())
+            self.assertIn(client.get(me_url).status_code, [401, 403])
+
+        # Single object delete view
+        client, session = login_victim()
+        self.client.post(
+            reverse('admin:usersessions_usersession_delete', args=[session.pk]),
+            {'post': 'yes'},
+        )
+        check_logged_out(client, session)
+
+        # Bulk "delete selected" action
+        client, session = login_victim()
+        self.client.post(
+            reverse('admin:usersessions_usersession_changelist'),
+            {
+                'action': 'delete_selected',
+                '_selected_action': [session.pk],
+                'post': 'yes',
+            },
+        )
+        check_logged_out(client, session)
+
+    def test_owner_admin_autocomplete(self):
+        """Test admin autocomplete endpoint for SalesOrder responsible field."""
+        url = reverse('admin:autocomplete')
+        response = self.get(
+            url,
+            data={
+                'term': self.user.username,
+                'app_label': 'order',
+                'model_name': 'salesorder',
+                'field_name': 'responsible',
+            },
+            expected_code=200,
+        )
+        data = response.json()
+        self.assertIn('results', data)
+        user_owner = Owner.get_owner(self.user)
+        owner_ids = [res['id'] for res in data['results']]
+        self.assertIn(str(user_owner.pk), owner_ids)
 
 
 class UserProfileTest(InvenTreeAPITestCase):
@@ -500,3 +698,52 @@ class UserProfileTest(InvenTreeAPITestCase):
         # Ensure primary_group is set to None
         profile.refresh_from_db()
         self.assertIsNone(profile.primary_group)
+
+    def test_tip_backfill_race(self):
+        """Test that backfilling tip results tolerates records created concurrently."""
+        tip_id = KNOWN_IDS[0]
+
+        TipResult.objects.create(user=self.user, tip_id=tip_id)
+
+        # Simulate another request creating the record after the existing IDs are checked
+        mock_qs = mock.Mock()
+        mock_qs.values_list.return_value = []
+
+        with mock.patch.object(TipResult.objects, 'filter', return_value=mock_qs):
+            TipResult.backfill(self.user)
+
+        results = TipResult.objects.filter(user=self.user)
+
+        self.assertEqual(results.filter(tip_id=tip_id).count(), 1)
+        self.assertEqual(set(results.values_list('tip_id', flat=True)), set(KNOWN_IDS))
+
+
+class UserProfileMetadataPermissionTests(InvenTreeAPITestCase):
+    """Tests for the generic metadata endpoint against the UserProfile model."""
+
+    def setUp(self):
+        """Create a second user with their own profile."""
+        from django.contrib.auth import get_user_model
+
+        super().setUp()
+
+        self.other_user = get_user_model().objects.create_user(
+            username='other_metadata_user', password='password'
+        )
+
+    def _metadata_url(self, pk):
+        return reverse(
+            'api-generic-metadata', kwargs={'model': 'userprofile', 'pk': pk}
+        )
+
+    def test_own_profile_metadata_is_accessible(self):
+        """A user can read/write their own profile metadata via the generic endpoint."""
+        url = self._metadata_url(self.user.profile.pk)
+        self.get(url, expected_code=200)
+        self.patch(url, {'metadata': {'x': 1}}, expected_code=200)
+
+    def test_other_users_profile_metadata_is_denied(self):
+        """A user cannot read/write another user's profile metadata via the generic endpoint."""
+        url = self._metadata_url(self.other_user.profile.pk)
+        self.get(url, expected_code=403)
+        self.patch(url, {'metadata': {'x': 1}}, expected_code=403)

@@ -94,7 +94,7 @@ export default function PurchasingIndex() {
         name: 'purchaseorders',
         label: t`Purchase Orders`,
         icon: <IconShoppingCart />,
-        hidden: !user.hasViewRole(UserRoles.purchase_order),
+        hidden: !user.hasViewVisible(UserRoles.purchase_order),
         selection: purchaseOrderView,
         onChange: setPurchaseOrderView,
         options: [
@@ -228,13 +228,13 @@ export default function PurchasingIndex() {
     supplierView
   ]);
 
-  if (!user.isLoggedIn() || !user.hasViewRole(UserRoles.purchase_order)) {
+  if (!user.isLoggedIn() || !user.hasViewVisible(UserRoles.purchase_order)) {
     return <PermissionDenied />;
   }
 
   return (
     <Stack>
-      <PageDetail title={t`Purchasing`} />
+      <PageDetail model={PluginPanelKey.purchasing} title={t`Purchasing`} />
       <PanelGroup
         pageKey='purchasing-index'
         panels={panels}

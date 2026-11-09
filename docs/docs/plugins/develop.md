@@ -12,7 +12,7 @@ We strongly recommend that you use the [Plugin Creator](./creator.md) tool when 
 
 ## Determine Requirements
 
-Before starting, you should have a clear understanding of what you want your plugin to do. In particular, consider the functionality provided by the available [plugin mixins](./index.md#plugin-mixins), and whether your plugin can be built using these mixins.
+Before starting, you should have a clear understanding of what you want your plugin to do. In particular, consider the functionality provided by the available [plugin mixins](#plugin-mixins), and whether your plugin can be built using these mixins.
 
 Consider the use-case for your plugin and define the exact function of the plugin, maybe write it down in a short readme. Then pick the mixins you need (they help reduce custom code and keep the system reliable if internal calls change).
 
@@ -23,11 +23,11 @@ Consider the use-case for your plugin and define the exact function of the plugi
 - Do you need to run in the background ([ScheduleMixin](./mixins/schedule.md)) or when things in InvenTree change ([EventMixin](./mixins/event.md))?
 - Does the plugin need configuration that should be user changeable ([SettingsMixin](./mixins/settings.md)) or static (just use a yaml in the config dir)?
 - You want to receive webhooks? Do not code your own untested function, use the WebhookEndpoint model as a base and override the perform_action method.
-- Do you need the full power of Django with custom models and all the complexity that comes with that – welcome to the danger zone and [AppMixin](./mixins/app.md). The plugin will be treated as a app by django and can maybe rack the whole instance.
+- Do you need the full power of Django with custom models and all the complexity that comes with that - welcome to the danger zone and [AppMixin](./mixins/app.md). The plugin will be treated as a app by django and can maybe rack the whole instance.
 
 ### Define Metadata
 
-Do not forget to [declare the metadata](./index.md#plugin-options) for your plugin, those will be used in the settings. At least provide a web link so users can file issues / reach you.
+Do not forget to [declare the metadata](#plugin-options) for your plugin, those will be used in the settings. At least provide a web link so users can file issues / reach you.
 
 ### Development Guidelines
 
@@ -36,7 +36,7 @@ If you want to make your life easier, try to follow these guidelines; break wher
 - Keep it simple - more that 1000 LOC are normally to much for a plugin
 - Use mixins where possible - we try to keep coverage high for them so they are not likely to break
 - Do not use internal functions - if a functions name starts with `_` it is internal and might change at any time
-- Keep you imports clean - the APIs for plugins and mixins are young and evolving (see [here](./index.md#imports)). Use
+- Keep you imports clean - the APIs for plugins and mixins are young and evolving (see [here](#imports)). Use
 ```
 from plugin import InvenTreePlugin, registry
 from plugin.mixins import APICallMixin, SettingsMixin, ScheduleMixin, BarcodeMixin
@@ -127,6 +127,7 @@ Supported mixin classes are:
 | Mixin | Description |
 | --- | --- |
 | [ActionMixin](./mixins/action.md) | Run custom actions |
+| [AllocateMixin](./mixins/allocate.md) | Customize automatic stock allocation |
 | [APICallMixin](./mixins/api.md) | Perform calls to external APIs |
 | [AppMixin](./mixins/app.md) | Integrate additional database tables |
 | [BarcodeMixin](./mixins/barcode.md) | Support custom barcode actions |
@@ -145,6 +146,7 @@ Supported mixin classes are:
 | [UserInterfaceMixin](./mixins/ui.md) | Add custom user interface features |
 | [UrlsMixin](./mixins/urls.md) | Respond to custom URL endpoints |
 | [ValidationMixin](./mixins/validation.md) | Provide custom validation of database models |
+| [WellKnownMixin](./mixins/wellknown.md) | Provide well-known endpoints on the root of an instance |
 
 ## Plugin Concepts
 

@@ -24,6 +24,9 @@ import {
 import InstanceDetail from '../../components/nav/InstanceDetail';
 import { PageDetail } from '../../components/nav/PageDetail';
 import AttachmentPanel from '../../components/panels/AttachmentPanel';
+import HistoryPanel, {
+  useShowHistoryPanel
+} from '../../components/panels/HistoryPanel';
 import NotesPanel from '../../components/panels/NotesPanel';
 import { PanelGroup } from '../../components/panels/PanelGroup';
 import ParametersPanel from '../../components/panels/ParametersPanel';
@@ -34,6 +37,7 @@ import {
   useEditApiFormModal
 } from '../../hooks/UseForm';
 import { useInstance } from '../../hooks/UseInstance';
+import { useInstanceInfo } from '../../hooks/UseInstanceInfo';
 import useStatusCodes from '../../hooks/UseStatusCodes';
 import { useGlobalSettingsState } from '../../states/SettingsStates';
 import { useUserState } from '../../states/UserState';
@@ -64,6 +68,11 @@ export default function ReturnOrderDetail() {
     }
   });
 
+  const { instanceInfo } = useInstanceInfo({
+    modelType: ModelType.returnorder,
+    modelId: order?.pk
+  });
+
   const roStatus = useStatusCodes({ modelType: ModelType.returnorder });
 
   const orderOpen = useMemo(() => {
@@ -90,6 +99,8 @@ export default function ReturnOrderDetail() {
       globalSettings.getSetting('INVENTREE_DEFAULT_CURRENCY')
     );
   }, [order, globalSettings]);
+
+  const showHistory = useShowHistoryPanel();
 
   const orderPanels: PanelType[] = useMemo(() => {
     return [
@@ -136,6 +147,7 @@ export default function ReturnOrderDetail() {
               <Accordion.Panel>
                 <ExtraLineItemTable
                   endpoint={ApiEndpoints.return_order_extra_line_list}
+                  importModelType='returnorderextraline'
                   orderId={order.pk}
                   orderDetailRefresh={refreshInstance}
                   currency={orderCurrency}
@@ -149,19 +161,26 @@ export default function ReturnOrderDetail() {
       },
       ParametersPanel({
         model_type: ModelType.returnorder,
-        model_id: order.pk
+        model_id: order.pk,
+        parameter_count: instanceInfo.parameter_count
       }),
       AttachmentPanel({
         model_type: ModelType.returnorder,
-        model_id: order.pk
+        model_id: order.pk,
+        attachment_count: instanceInfo.attachment_count
       }),
       NotesPanel({
         model_type: ModelType.returnorder,
         model_id: order.pk,
-        has_note: !!order.notes
+        note_count: instanceInfo.note_count
+      }),
+      HistoryPanel({
+        model_type: ModelType.returnorder,
+        model_id: order.pk,
+        visible: showHistory
       })
     ];
-  }, [order, id, user]);
+  }, [order, id, user, instanceInfo, showHistory]);
 
   const orderBadges: ReactNode[] = useMemo(() => {
     return instanceQuery.isLoading
@@ -186,7 +205,6 @@ export default function ReturnOrderDetail() {
     pk: order.pk,
     title: t`Edit Return Order`,
     fields: returnOrderFields,
-    queryParams: new URLSearchParams({ tags: 'true' }),
     onFormSuccess: () => {
       refreshInstance();
     }
@@ -345,6 +363,8 @@ export default function ReturnOrderDetail() {
       >
         <Stack gap='xs'>
           <PageDetail
+            model={ModelType.returnorder}
+            id={order.pk}
             title={`${t`Return Order`}: ${order.reference}`}
             subtitle={subtitle}
             imageUrl={order.customer_detail?.image}

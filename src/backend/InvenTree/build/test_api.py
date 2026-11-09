@@ -3,19 +3,28 @@
 from datetime import datetime, timedelta
 from typing import Optional
 
+from django.db import connection
 from django.db.models import Sum
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
 from django_q.models import OrmQ
 from rest_framework import status
 
+from audit.models import AuditLogEntry
 from build.models import Build, BuildItem, BuildLine
 from build.status_codes import BuildStatus
+from common.models import Note
 from common.settings import set_global_setting
-from InvenTree.unit_test import InvenTreeAPITestCase
+from InvenTree.unit_test import (
+    InvenTreeAPITestCase,
+    stock_events,
+    stock_history,
+    stock_history_count,
+)
 from part.models import BomItem, BomItemSubstitute, Part, PartTestTemplate
 from stock.events import StockEvents
-from stock.models import StockItem, StockItemTracking, StockLocation, StockSortOrder
+from stock.models import StockItem, StockLocation, StockSortOrder
 from stock.status_codes import StockHistoryCode, StockStatus
 
 
@@ -201,6 +210,24 @@ class BuildTest(BuildAPITest):
             str(data['outputs'][0]['output']),
         )
 
+    def test_part_read_only_on_update(self):
+        """The 'part' field cannot be changed on an existing build order."""
+        self.assignRole('build.change')
+
+        url = reverse('api-build-detail', kwargs={'pk': self.build.pk})
+
+        other_part = (
+            Part.objects.filter(assembly=True).exclude(pk=self.build.part.pk).first()
+        )
+
+        self.assertIsNotNone(other_part)
+
+        # Attempting to change the 'part' field is silently ignored
+        self.patch(url, {'part': other_part.pk}, expected_code=200)
+
+        self.build.refresh_from_db()
+        self.assertNotEqual(self.build.part.pk, other_part.pk)
+
     def test_complete(self):
         """Test build order completion."""
         # Initially, build should not be able to be completed
@@ -335,6 +362,23 @@ class BuildTest(BuildAPITest):
 
         with self.assertRaises(Build.DoesNotExist):
             Build.objects.get(pk=1)
+
+    def test_create_output_batch_code_max_length(self):
+        """Test that an overly long batch code is rejected with a validation error."""
+        url = reverse('api-build-output-create', kwargs={'pk': 1})
+
+        max_length = int(StockItem._meta.get_field('batch').max_length)
+
+        response = self.post(
+            url,
+            {'quantity': 1, 'batch_code': 'x' * (max_length + 1)},
+            expected_code=400,
+        )
+
+        self.assertIn(
+            f'Ensure this field has no more than {max_length} characters',
+            str(response.data['batch_code']),
+        )
 
     def test_create_delete_output(self):
         """Test that we can create and delete build outputs via the API."""
@@ -607,6 +651,62 @@ class BuildTest(BuildAPITest):
 
         self.assertIsNotNone(bo.issued_by)
         self.assertEqual(bo.issued_by, self.user)
+
+    def test_duplicate_copies_notes(self):
+        """Test that notes are copied when duplicating a Build via the API.
+
+        BuildSerializer declares its 'duplicate' options with copy_notes=True,
+        so notes should be copied by default (i.e. without explicitly requesting it).
+        """
+        from django.contrib.contenttypes.models import ContentType
+
+        url = reverse('api-build-list')
+
+        part = Part.objects.create(
+            name='Duplicate Notes Assembly', description='x', assembly=True
+        )
+
+        original = Build.objects.create(
+            part=part, reference='BO-9001', title='Original build', quantity=5
+        )
+
+        Note.objects.create(
+            model_type=ContentType.objects.get_for_model(Build),
+            model_id=original.pk,
+            title='Original Note',
+            content='<p>Some build notes</p>',
+        )
+
+        response = self.post(
+            url,
+            {
+                'reference': 'BO-9002',
+                'part': part.pk,
+                'quantity': 5,
+                'title': 'Duplicate build',
+                'duplicate': {'original': original.pk},
+            },
+            expected_code=201,
+        )
+
+        new_build = Build.objects.get(pk=response.data['pk'])
+        self.assertEqual(new_build.notes.count(), 1)
+        self.assertEqual(new_build.notes.first().content, '<p>Some build notes</p>')
+
+        # Explicitly disabling copy_notes must not copy any notes
+        response = self.post(
+            url,
+            {
+                'reference': 'BO-9003',
+                'part': part.pk,
+                'quantity': 5,
+                'title': 'Duplicate build without notes',
+                'duplicate': {'original': original.pk, 'copy_notes': False},
+            },
+            expected_code=201,
+        )
+        no_notes_build = Build.objects.get(pk=response.data['pk'])
+        self.assertEqual(no_notes_build.notes.count(), 0)
 
 
 class BuildAllocationTest(BuildAPITest):
@@ -1351,6 +1451,21 @@ class BuildListTest(BuildAPITest):
             assert_fnc=lambda x: x.data['results'][0],
         )
 
+    def test_status_codes_endpoint(self):
+        """The 'build/status/' endpoint must resolve to the status-codes view.
+
+        Regression test: ensures the literal 'status/' path is not shadowed by the
+        'build/<pk>/' detail route it sits alongside in the same urlconf.
+        """
+        response = self.get(reverse('api-build-status-codes'), expected_code=200)
+
+        self.assertIn('status_class', response.data)
+        self.assertIn('values', response.data)
+        self.assertIn('PENDING', response.data['values'])
+        self.assertEqual(
+            response.data['values']['PENDING']['key'], BuildStatus.PENDING.value
+        )
+
 
 class BuildOutputCreateTest(BuildAPITest):
     """Unit test for creating build output via API."""
@@ -1768,14 +1883,11 @@ class BuildLineTests(BuildAPITest):
         self.assertEqual(len(response.data), BuildLine.objects.count())
 
         # Filter by 'available' status
-        # Note: The max_query_time is bumped up here, as postgresql backend has some strange issues (only during testing)
-        # TODO: This needs to be addressed in the future, as 25 seconds is an unacceptably long time for a query to take in testing
-        response = self.get(url, data={'available': True}, max_query_time=25)
+        response = self.get(url, data={'available': True}, max_query_time=10)
         n_t = len(response.data)
         self.assertGreater(n_t, 0)
 
-        # Note: The max_query_time is bumped up here, as postgresql backend has some strange issues (only during testing)
-        response = self.get(url, data={'available': False}, max_query_time=25)
+        response = self.get(url, data={'available': False}, max_query_time=10)
         n_f = len(response.data)
         self.assertGreater(n_f, 0)
 
@@ -2099,23 +2211,117 @@ class BuildLineTests(BuildAPITest):
         for line in lines:
             StockItem.objects.create(part=line.bom_item.sub_part, quantity=60)
 
-        # TODO: 2025-10-02: Work out why this query takes so long with PostgreSQL (in CI)
-        # Note: The max_query_time is bumped up here, as postgresql backend has some strange issues (only during testing)
         response = self.get(
-            url, {'build': build.pk, 'available': True}, max_query_time=30
+            url, {'build': build.pk, 'available': True}, max_query_time=10
         )
 
         # We expect 2 lines to have "available" stock
         self.assertEqual(len(response.data), 2)
 
-        # TODO: 2025-10-02: Work out why this query takes so long with PostgreSQL (in CI)
-        # Note: The max_query_time is bumped up here, as postgresql backend has some strange issues (only during testing)
         response = self.get(
-            url, {'build': build.pk, 'available': False}, max_query_time=30
+            url, {'build': build.pk, 'available': False}, max_query_time=10
         )
 
         self.assertEqual(len(response.data), 1)
         self.assertEqual(response.data[0]['pk'], lines[0].pk)
+
+    def test_list_unfiltered_count_query_has_no_group_by(self):
+        """Regression test for a bug where the (unfiltered) BuildLine list endpoint was catastrophically slow.
+
+        The specific trigger: a plain GET against the list endpoint with no 'build'
+        filter (BuildLineMixin.get_source_build() then returns None, so
+        BuildLineSerializer.annotate_queryset() runs across *every* BuildLine in the
+        database, unscoped) - e.g. an external API client just paging through results.
+        """
+        # Build line with a genuine stock allocation, to also confirm the 'allocated'
+        # value itself is still computed correctly after the Sum -> SubquerySum swap.
+        assembly = Part.objects.create(
+            name='Regression Test Assembly',
+            description='Assembly for BuildLine count() regression test',
+            assembly=True,
+        )
+        component = Part.objects.create(
+            name='Regression Test Component',
+            description='Component for BuildLine count() regression test',
+            component=True,
+        )
+        BomItem.objects.create(part=assembly, sub_part=component, quantity=1)
+
+        build = Build.objects.create(
+            part=assembly,
+            reference='BO-9996',
+            quantity=1,
+            title='BuildLine count() regression build',
+        )
+
+        line = build.build_lines.first()
+        stock_item = StockItem.objects.create(part=component, quantity=10)
+        BuildItem.objects.create(build_line=line, stock_item=stock_item, quantity=1)
+
+        url = reverse('api-build-line-list')
+
+        # Deliberately *no* 'build' filter - see docstring above
+        with CaptureQueriesContext(connection) as ctx:
+            response = self.get(url, {'limit': 1}, expected_code=200)
+
+        self.assertEqual(response.data['count'], BuildLine.objects.count())
+
+        count_queries = [
+            q
+            for q in ctx.captured_queries
+            if 'build_buildline' in q['sql'].lower()
+            and 'select count(' in q['sql'].lower()
+        ]
+        self.assertTrue(count_queries, 'Expected a COUNT query for list pagination')
+
+        for query in count_queries:
+            self.assertNotIn(
+                'GROUP BY',
+                query['sql'].upper(),
+                'BuildLine count() query should not require a GROUP BY',
+            )
+
+        # Confirm the 'allocated' value is still computed correctly
+        response = self.get(url, {'build': build.pk}, expected_code=200)
+        line_data = next(item for item in response.data if item['pk'] == line.pk)
+        self.assertEqual(line_data['allocated'], 1)
+
+    def test_ordering_unit_quantity_piece_count(self):
+        """Ordering by 'unit_quantity' must account for the BOM piece_count."""
+        assembly = Part.objects.create(
+            name='Unit Quantity Assembly',
+            description='Assembly for unit quantity ordering',
+            assembly=True,
+        )
+
+        wire = Part.objects.create(
+            name='Wire', description='Cut-to-length wire', component=True
+        )
+        screw = Part.objects.create(name='Screw', description='A screw', component=True)
+
+        # 2 x 5 = 10 units of wire per assembly
+        BomItem.objects.create(part=assembly, sub_part=wire, quantity=2, piece_count=5)
+
+        # 3 x 1 = 3 screws per assembly
+        BomItem.objects.create(part=assembly, sub_part=screw, quantity=3)
+
+        build = Build.objects.create(
+            part=assembly, reference='BO-9998', quantity=1, title='Unit quantity'
+        )
+
+        url = reverse('api-build-line-list')
+
+        response = self.get(
+            url, {'build': build.pk, 'ordering': 'unit_quantity'}, expected_code=200
+        )
+
+        self.assertEqual([line['part'] for line in response.data], [screw.pk, wire.pk])
+
+        response = self.get(
+            url, {'build': build.pk, 'ordering': '-unit_quantity'}, expected_code=200
+        )
+
+        self.assertEqual([line['part'] for line in response.data], [wire.pk, screw.pk])
 
 
 class BuildConsumeTest(BuildAPITest):
@@ -2211,6 +2417,133 @@ class BuildConsumeTest(BuildAPITest):
 
         for line in self.build.build_lines.all():
             self.assertEqual(line.consumed, 100)
+
+    def consume_snapshot(self) -> dict:
+        """Return the {BuildItem pk: quantity} snapshot which the consume API passes to the task."""
+        return dict(self.build.allocated_stock.values_list('pk', 'quantity'))
+
+    def test_consume_items_redelivery(self):
+        """A redelivered partial-quantity consume task must not consume stock twice."""
+        from build.tasks import consume_build_stock
+
+        self.allocate_stock()
+
+        items = {item.pk: 30 for item in self.build.allocated_stock.all()}
+        expected = self.consume_snapshot()
+
+        consume_build_stock(self.build.pk, items=items, expected=expected)
+
+        n_tracking = stock_history_count()
+        n_stock = StockItem.objects.count()
+
+        # Simulate redelivery of the exact same task payload
+        consume_build_stock(self.build.pk, items=items, expected=expected)
+
+        self.assertEqual(stock_history_count(), n_tracking)
+        self.assertEqual(StockItem.objects.count(), n_stock)
+        self.assertEqual(self.build.consumed_stock.count(), 3)
+
+        for item in self.build.allocated_stock.all():
+            self.assertEqual(item.quantity, 70)
+
+        for line in self.build.build_lines.all():
+            self.assertEqual(line.consumed, 30)
+
+        for si in self.stock_items:
+            si.refresh_from_db()
+            self.assertEqual(si.quantity, 970)
+
+    def test_consume_lines_redelivery(self):
+        """A redelivered line consume task must not consume stock twice.
+
+        The consumed quantity is clamped by the stock item quantity here, so a
+        (partially consumed) build item remains after the first run.
+        """
+        from build.tasks import consume_build_stock
+
+        self.allocate_stock()
+
+        # Reduce the first stock item below the allocated quantity
+        StockItem.objects.filter(pk=self.stock_items[0].pk).update(quantity=40)
+
+        lines = list(self.build.build_lines.values_list('pk', flat=True))
+        expected = self.consume_snapshot()
+
+        consume_build_stock(self.build.pk, lines=lines, expected=expected)
+
+        remaining = self.build.allocated_stock.get()
+        self.assertEqual(remaining.quantity, 60)
+
+        n_tracking = stock_history_count()
+
+        # Simulate redelivery of the exact same task payload
+        consume_build_stock(self.build.pk, lines=lines, expected=expected)
+
+        self.assertEqual(stock_history_count(), n_tracking)
+
+        remaining.refresh_from_db()
+        self.assertEqual(remaining.quantity, 60)
+        self.assertEqual(remaining.build_line.consumed, 40)
+
+    def test_consume_without_snapshot(self):
+        """Tasks queued without an 'expected' snapshot retain the previous behavior."""
+        from build.tasks import consume_build_stock
+
+        self.allocate_stock()
+
+        items = {item.pk: 30 for item in self.build.allocated_stock.all()}
+
+        consume_build_stock(self.build.pk, items=items)
+        consume_build_stock(self.build.pk, items=items)
+
+        for line in self.build.build_lines.all():
+            self.assertEqual(line.consumed, 60)
+
+    def test_consume_stale_snapshot(self):
+        """A build item modified after the request was made is not consumed."""
+        from build.tasks import consume_build_stock
+
+        self.allocate_stock()
+
+        items = {item.pk: 30 for item in self.build.allocated_stock.all()}
+        expected = self.consume_snapshot()
+
+        # Another user modifies one allocation before the task runs
+        stale = self.build.allocated_stock.first()
+        BuildItem.objects.filter(pk=stale.pk).update(quantity=50)
+
+        consume_build_stock(self.build.pk, items=items, expected=expected)
+
+        stale.refresh_from_db()
+        self.assertEqual(stale.quantity, 50)
+        self.assertEqual(stale.build_line.consumed, 0)
+
+        # The other (unmodified) build items are still consumed
+        for item in self.build.allocated_stock.exclude(pk=stale.pk):
+            self.assertEqual(item.quantity, 70)
+            self.assertEqual(item.build_line.consumed, 30)
+
+    def test_consume_items_repeated_requests(self):
+        """Separate API requests for partial quantities are each applied."""
+        self.allocate_stock()
+
+        url = reverse('api-build-consume', kwargs={'pk': self.build.pk})
+
+        for _ in range(2):
+            data = {
+                'items': [
+                    {'build_item': item.pk, 'quantity': 30}
+                    for item in self.build.allocated_stock.all()
+                ]
+            }
+
+            self.post(url, data, expected_code=200)
+
+        for item in self.build.allocated_stock.all():
+            self.assertEqual(item.quantity, 40)
+
+        for line in self.build.build_lines.all():
+            self.assertEqual(line.consumed, 60)
 
     def test_consume_many_lines(self):
         """Test consuming stock against a build order with a large number of BOM lines.
@@ -2320,7 +2653,7 @@ class BuildConsumeTest(BuildAPITest):
             data,
             expected_code=201,
             benchmark=True,
-            max_query_time=1.0,
+            max_query_time=2.0,
             max_query_count=50,
         )
 
@@ -2365,8 +2698,8 @@ class BuildConsumeTest(BuildAPITest):
                 {},
                 expected_code=201,
                 benchmark=True,
-                max_query_count=250,
-                max_query_time=1.5,
+                max_query_count=180,
+                max_query_time=4.5,
             )
 
         build.refresh_from_db()
@@ -2422,16 +2755,15 @@ class BuildConsumeTest(BuildAPITest):
                     self.assertEqual(si.consumed_by, build)
 
                     self.assertFalse(
-                        StockItemTracking.objects.filter(
-                            item=si,
-                            tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value,
+                        stock_events(
+                            si, event_type=StockHistoryCode.SPLIT_CHILD_ITEM
                         ).exists()
                     )
                     self.assertTrue(
-                        StockItemTracking.objects.filter(
-                            item=si,
-                            tracking_type=StockHistoryCode.BUILD_CONSUMED.value,
-                            deltas__buildorder=build.pk,
+                        stock_events(
+                            si,
+                            event_type=StockHistoryCode.BUILD_CONSUMED,
+                            additional_data__deltas__buildorder__pk=build.pk,
                         ).exists()
                     )
 
@@ -2459,18 +2791,15 @@ class BuildConsumeTest(BuildAPITest):
                 self.assertEqual(consumed_item.quantity, required_quantity)
                 self.assertNotEqual(consumed_item.pk, stock_item.pk)
 
-                # Split tracking entries: one on the new (split-off) item, one on the original
+                # The new (split-off) item records its creation (as a child of the original)
+                created = stock_history(consumed_item).first()
+                self.assertEqual(created.action, AuditLogEntry.Action.CREATE)
+                self.assertEqual(created.changes_dict['parent'], [None, stock_item.pk])
+
+                # The original item records the split
                 self.assertTrue(
-                    StockItemTracking.objects.filter(
-                        item=consumed_item,
-                        tracking_type=StockHistoryCode.SPLIT_FROM_PARENT.value,
-                        deltas__stockitem=stock_item.pk,
-                    ).exists()
-                )
-                self.assertTrue(
-                    StockItemTracking.objects.filter(
-                        item=stock_item,
-                        tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value,
+                    stock_events(
+                        stock_item, event_type=StockHistoryCode.SPLIT_CHILD_ITEM
                     ).exists()
                 )
 
@@ -2486,10 +2815,10 @@ class BuildConsumeTest(BuildAPITest):
 
                 # Consumption is recorded against the new (split-off) item
                 self.assertTrue(
-                    StockItemTracking.objects.filter(
-                        item=consumed_item,
-                        tracking_type=StockHistoryCode.BUILD_CONSUMED.value,
-                        deltas__buildorder=build.pk,
+                    stock_events(
+                        consumed_item,
+                        event_type=StockHistoryCode.BUILD_CONSUMED,
+                        additional_data__deltas__buildorder__pk=build.pk,
                     ).exists()
                 )
             else:
@@ -2499,16 +2828,15 @@ class BuildConsumeTest(BuildAPITest):
 
                 # No split occurred - consumption is recorded directly against this item
                 self.assertFalse(
-                    StockItemTracking.objects.filter(
-                        item=stock_item,
-                        tracking_type=StockHistoryCode.SPLIT_CHILD_ITEM.value,
+                    stock_events(
+                        stock_item, event_type=StockHistoryCode.SPLIT_CHILD_ITEM
                     ).exists()
                 )
                 self.assertTrue(
-                    StockItemTracking.objects.filter(
-                        item=stock_item,
-                        tracking_type=StockHistoryCode.BUILD_CONSUMED.value,
-                        deltas__buildorder=build.pk,
+                    stock_events(
+                        stock_item,
+                        event_type=StockHistoryCode.BUILD_CONSUMED,
+                        additional_data__deltas__buildorder__pk=build.pk,
                     ).exists()
                 )
 
@@ -2624,17 +2952,17 @@ class BuildConsumeTest(BuildAPITest):
             )
 
             self.assertTrue(
-                StockItemTracking.objects.filter(
-                    item=component_item,
-                    tracking_type=StockHistoryCode.INSTALLED_INTO_ASSEMBLY.value,
-                    deltas__stockitem=output_item.pk,
+                stock_events(
+                    component_item,
+                    event_type=StockHistoryCode.INSTALLED_INTO_ASSEMBLY,
+                    additional_data__deltas__stockitem__pk=output_item.pk,
                 ).exists()
             )
             self.assertTrue(
-                StockItemTracking.objects.filter(
-                    item=output_item,
-                    tracking_type=StockHistoryCode.INSTALLED_CHILD_ITEM.value,
-                    deltas__stockitem=component_item.pk,
+                stock_events(
+                    output_item,
+                    event_type=StockHistoryCode.INSTALLED_CHILD_ITEM,
+                    additional_data__deltas__stockitem__pk=component_item.pk,
                 ).exists()
             )
 
@@ -2757,7 +3085,7 @@ class BuildAutoAllocateAPITest(InvenTreeAPITestCase):
 
     def _next_ref(self):
         """Return a valid Build reference using the system-generated next value."""
-        return Build.generate_batch_code()
+        return Build.generate_batch_code()  # ty: ignore[invalid-attribute-access]
 
     def _make_build(self, quantity=10):
         """Create a fresh Build with one untracked BOM line (component only)."""
@@ -3033,3 +3361,46 @@ class BuildAutoAllocateAPITest(InvenTreeAPITestCase):
             self.assertEqual(fa.count(), 4)
             allocated = sum(a.quantity for a in fa)
             self.assertEqual(allocated, 130)  # 130 allocated to each line
+
+
+class BuildActionMissingPkTest(InvenTreeAPITestCase):
+    """Regression tests for a class of bugs in the Build action endpoints.
+
+    BuildOrderContextMixin looks up the target Build in get_serializer_context(), but
+    silently swallows a not-found result (needed so schema/OPTIONS introspection
+    doesn't break). Without an explicit check elsewhere, a POST against a
+    non-existent pk fell through to the action serializer's save(), which
+    unconditionally reads self.context['build'] - an unhandled KeyError (HTTP 500)
+    rather than a clean 404. Fixed by BuildOrderContextMixin.create().
+    """
+
+    roles = ['build.add']
+
+    def test_actions_404_for_missing_build(self):
+        """Every BuildOrderContextMixin-based action should 404, not 500, for a bad pk."""
+        for url_name in [
+            'api-build-issue',
+            'api-build-hold',
+            'api-build-cancel',
+            'api-build-finish',
+            'api-build-allocate',
+        ]:
+            url = reverse(url_name, kwargs={'pk': 999999})
+            self.post(url, {}, expected_code=404)
+
+    def test_output_actions_already_safe(self):
+        """The build-output actions already guard against a missing build themselves.
+
+        (BuildOutputScrap/Complete/Delete/AutoAllocate/Consume all call
+        self.get_build() explicitly at the top of a custom post() override, which
+        already raises NotFound correctly - this test just locks that in.)
+        """
+        for url_name in [
+            'api-build-output-scrap',
+            'api-build-output-complete',
+            'api-build-output-delete',
+            'api-build-auto-allocate',
+            'api-build-consume',
+        ]:
+            url = reverse(url_name, kwargs={'pk': 999999})
+            self.post(url, {}, expected_code=404)

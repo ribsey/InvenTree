@@ -205,6 +205,12 @@ USER_SETTINGS: dict[str, InvenTreeSettingsKeyType] = {
         'default': False,
         'validator': bool,
     },
+    'ROTATE_TABLE_HEADERS': {
+        'name': _('Rotated Table Headers'),
+        'description': _('Display table column headers with rotated (vertical) text'),
+        'default': False,
+        'validator': bool,
+    },
     'SHOW_SPOTLIGHT': {
         'name': _('Show Spotlight'),
         'description': _('Enable spotlight navigation functionality'),
@@ -243,9 +249,23 @@ USER_SETTINGS: dict[str, InvenTreeSettingsKeyType] = {
         'default': True,
         'validator': bool,
     },
+    'DISPLAY_HISTORY_TAB': {
+        'name': _('Show Change History'),
+        'description': _(
+            'Display the change history (audit log) panel on detail pages'
+        ),
+        'default': False,
+        'validator': bool,
+    },
     'ENABLE_LAST_BREADCRUMB': {
         'name': _('Show Last Breadcrumb'),
         'description': _('Show the current page in breadcrumbs'),
+        'default': False,
+        'validator': bool,
+    },
+    'NAVIGATION_TREE_PINNED': {
+        'name': _('Pin Navigation Tree'),
+        'description': _('Display navigation tree permanently'),
         'default': False,
         'validator': bool,
     },
@@ -294,6 +314,14 @@ USER_SETTINGS: dict[str, InvenTreeSettingsKeyType] = {
             'Automatically default to showing items/parts instead of sub-levels for locations or categories with no children'
         ),
         'default': False,
+        'validator': bool,
+    },
+    'USE_TABLE_NAVIGATION': {
+        'name': _('Enable Filtered Detail Navigation'),
+        'description': _(
+            'Enable persisting of filtered detail navigation parameters to the view url'
+        ),
+        'default': True,
         'validator': bool,
     },
 }
